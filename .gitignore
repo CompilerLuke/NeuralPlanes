@@ -1,0 +1,4 @@
+.idea/*
+data/*
+__pycache__
+NeuralPlanes/__pycache__/*
