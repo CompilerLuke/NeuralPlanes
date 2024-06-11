@@ -1,5 +1,3 @@
-import os.path
-
 import cv2
 import torch
 from scipy.spatial.transform import Rotation
@@ -12,8 +10,10 @@ import itertools
 from matplotlib import pyplot as plt
 from NeuralPlanes.camera import Camera
 from NeuralPlanes.plane import make_planes, draw_planes
-from NeuralPlanes.model import MapModule
-from NeuralPlanes.train import train_map, create_image_loader
+from NeuralPlanes.nerf.model import MapModule
+from NeuralPlanes.utils import create_image_loader
+from NeuralPlanes import nerf
+
 
 def parse_trajectories(ref_trajectories):
     with open(ref_trajectories, 'r') as f:
@@ -25,13 +25,13 @@ def parse_trajectories(ref_trajectories):
 
             # todo: read intrinsics from sensors.txt
             quat = torch.tensor([float(x) for x in tokens[2:6]])
-            
+
             pose = Camera(
                 size=torch.tensor([1280, 1920]),
                 f=torch.tensor([960, 960]),
                 c=torch.tensor([639.8245614035088, 959.8245614035088]),
                 t=torch.tensor([float(x) for x in tokens[6:9]]),
-                R= torch.tensor(Rotation.from_quat(quat).as_matrix(), dtype=torch.float)
+                R=torch.tensor(Rotation.from_quat(quat).as_matrix(), dtype=torch.float)
             )
 
             trajectories[image] = pose
@@ -39,31 +39,32 @@ def parse_trajectories(ref_trajectories):
         return trajectories
     raise "Could not load reference trajectories"
 
+
 def parse_floorplan(floor_plan_path):
     floor_plan = cv2.imread(floor_plan_path + "hg_floor_plan_e.png")
 
-    with open(floor_plan_path + "transforms.json") as f: 
+    with open(floor_plan_path + "transforms.json") as f:
         transforms = json.load(f)
     with open(floor_plan_path + "hg_floor_plan_e.json") as f:
         planes_json = json.load(f)
 
-    floor_plan_height, floor_plan_width,_ = floor_plan.shape
+    floor_plan_height, floor_plan_width, _ = floor_plan.shape
     img_rel_to_abs = torch.tensor(transforms["relative_to_absolute"]) @ torch.tensor(transforms["floor_to_relative"])
     ground = -5
     height = 20
 
-    x0s,x1s,x2s = [],[],[]
+    x0s, x1s, x2s = [], [], []
 
     # Add floor
-    x0,x1,x2 = torch.tensor([
-        [0.,0.,1.],
-        [1.,0.,1.],
-        [1.,1.,1.]
+    x0, x1, x2 = torch.tensor([
+        [0., 0., 1.],
+        [1., 0., 1.],
+        [1., 1., 1.]
     ]) @ img_rel_to_abs.T
-    
-    x0s.append(torch.tensor([x0[0],x0[1],ground])[None])
-    x1s.append(torch.tensor([x1[0],x1[1],ground])[None])
-    x2s.append(torch.tensor([x2[0],x2[1],ground])[None])
+
+    x0s.append(torch.tensor([x0[0], x0[1], ground])[None])
+    x1s.append(torch.tensor([x1[0], x1[1], ground])[None])
+    x2s.append(torch.tensor([x2[0], x2[1], ground])[None])
 
     for polygon in planes_json:
         contour = torch.stack([torch.tensor([p["x"], p["y"]]) for p in polygon["content"]])
@@ -71,19 +72,20 @@ def parse_floorplan(floor_plan_path):
 
         n = contour.shape[0]
 
-        contour = contour / torch.tensor([floor_plan_width, floor_plan_height]) # To relative image coordinates 0-1
-        contour = torch.cat([contour, torch.ones((n,1))], dim=1)
-        contour = (contour @ img_rel_to_abs.T)[:,:2] # To absolute world-space
+        contour = contour / torch.tensor([floor_plan_width, floor_plan_height])  # To relative image coordinates 0-1
+        contour = torch.cat([contour, torch.ones((n, 1))], dim=1)
+        contour = (contour @ img_rel_to_abs.T)[:, :2]  # To absolute world-space
 
-        x0 = torch.cat([contour[:-1], torch.full((n-1,1), ground)], dim=1)
-        x1 = torch.cat([contour[1:], torch.full((n-1,1), ground)], dim=1)
-        x2 = x1 + torch.tensor([0,0,height])
+        x0 = torch.cat([contour[:-1], torch.full((n - 1, 1), ground)], dim=1)
+        x1 = torch.cat([contour[1:], torch.full((n - 1, 1), ground)], dim=1)
+        x2 = x1 + torch.tensor([0, 0, height])
 
         x0s.append(x0)
         x1s.append(x1)
         x2s.append(x2)
 
-    return floor_plan, (torch.cat(x0s,dim=0),torch.cat(x1s,dim=0),torch.cat(x2s,dim=0))
+    return floor_plan, (torch.cat(x0s, dim=0), torch.cat(x1s, dim=0), torch.cat(x2s, dim=0))
+
 
 @dataclass
 class LocalFeatures:
@@ -105,6 +107,7 @@ def list_h5_names(path):
         fd.visititems(visit_fn)
     return list(set(names))
 
+
 def db_iterator(paths):
     if isinstance(paths, (Path, str)):
         paths = [paths]
@@ -120,6 +123,7 @@ def db_iterator(paths):
                 if name.startswith("floor_plan"):
                     continue
                 yield Path(name).stem.replace("__", "_"), fd[name]
+
 
 def load_keypoint_database(paths) -> LocalFeatures:
     if isinstance(paths, (Path, str)):
@@ -147,7 +151,8 @@ def load_keypoint_database(paths) -> LocalFeatures:
         db_names=db_names
     )
 
-if __name__ == "__main__":
+
+def train_nerf(planes, map_module):
     building_path = "../data/HG_navviz/"
     floor_plan_path = building_path + "raw_data/floor_plan/"
     train_path = "../data/train_HG/"
@@ -155,23 +160,26 @@ if __name__ == "__main__":
     trajectories = parse_trajectories(building_path + "trajectories.txt")
     floor_plan_img, plane_points = parse_floorplan(floor_plan_path)
 
-    local_features = load_keypoint_database(building_path+"features.h5")
+    local_features = load_keypoint_database(building_path + "features.h5")
 
-    #plane_points = [x[0:6] for x in plane_points]
+    # plane_points = [x[0:6] for x in plane_points]
 
     map_dim = 24
     planes = make_planes(plane_points, resolution=0.25)
 
     ax = plt.figure().add_subplot(projection='3d')
     draw_planes(ax, planes=planes)
-    plt.savefig(train_path+"plane_plot.png")
+    plt.savefig(train_path + "plane_plot.png")
 
     map_module = MapModule(planes, map_dim)
 
-    model_file = train_path+"model.pt"
-    #if os.path.exists(model_file):
-    #    map_module.load_state_dict(torch.load(model_file))
+    model_file = train_path + "model.pt"
 
     map_module = torch.compile(map_module)
+    nerf.training.train_map(map_module, create_image_loader(building_path + "raw_data/images_undistr_center",
+                                                            trajectories=trajectories, keypoints=local_features),
+                            output_dir=train_path)
 
-    train_map(map_module, create_image_loader(building_path+"raw_data/images_undistr_center", trajectories=trajectories, keypoints=local_features), output_dir=train_path)
+
+if __name__ == "__main__":
+    pass

@@ -1,12 +1,26 @@
 import unittest
-from NeuralPlanes.plane import project_to_planes, draw_planes, project_to_planes_sparse
-from NeuralPlanes.hg_pipeline import make_planes, parse_floorplan, parse_trajectories
+from NeuralPlanes.plane import *
+from NeuralPlanes.camera import Camera, frustum_points
 from matplotlib import pyplot as plt
 import torch
 
-class PlanesTest():
+class PlanesTest(unittest.TestCase):
+    def __init__(self, *args, **kwargs):
+        super(PlanesTest, self).__init__(*args, **kwargs)
+
+        # Plane xy, yz, xz
+        x0 = torch.tensor([[0,0,0], [0,0,0], [0,0,0]], dtype=torch.float)
+        x1 = torch.tensor([[1,0,0], [0,1,0], [1,0,0]], dtype=torch.float)
+        x2 = torch.tensor([[1,1,0], [0,1,1], [1,0,1]], dtype=torch.float)
+
+        self.basic_planes = make_planes((x0,x1,x2), resolution=0)
+
+        self.basic_point = torch.tensor([0.5,0.5,0.5])
+
     def test_project_sparse(self):
-        pos = trajectories[list(trajectories.keys())[50]].t[None,None,None,None]
+        """
+        planes = self.basic_planes
+        pos = self.basic_point[None,None,None]
         pixel_ids, plane_ids, proj, coord = project_to_planes(planes, pos)
 
         pixel_ids2, plane_ids2, coord2 = project_to_planes_sparse(planes, pos.repeat([1,1,2,2,1]), stride=2)
@@ -28,21 +42,41 @@ class PlanesTest():
 
         ax.set_aspect('equal')
         indices = torch.unique(plane_ids)
-        draw_planes(ax, planes, indices=indices[indices != 0])
+        draw_planes(ax, self.basic_planes, indices=indices[indices != 0])
+        """
 
-if __name__ == "__main__":
-    building_path = "../data/HG_navviz/"
-    floor_plan_path = building_path + "raw_data/floor_plan/"
-    train_path = "../data/train_HG/"
+    def test_plane_box_points(self):
+        box_points = plane_box_points(self.basic_planes, 1, max_dist=100)
+        self.assertTrue(torch.allclose(box_points, torch.tensor([[   0.,    0.,    0.],
+        [   0.,    1.,    0.],
+        [   0.,    1.,    1.],
+        [   0.,    0.,    1.],
+        [100.,    0.,    0.],
+        [100.,    1.,    0.],
+        [100.,    1.,    1.],
+        [100.,    0.,    1.]])))
 
-    trajectories = parse_trajectories(building_path + "trajectories.txt")
-    floor_plan_img, plane_points = parse_floorplan(floor_plan_path)
+    def test_plane_frustum_intersection(self):
+        fps = frustum_points(Camera(
+            size=torch.tensor([1.,1.]),
+            f=torch.tensor([0.5,0.5]),
+            c=torch.tensor([0.5,0.5]),
+            t=torch.tensor([0.5,0.5,0.]),
+            R=torch.diag(torch.ones(3))
+        ), 0.1, 0.4)
 
-    #plane_points = [x[0:6] for x in plane_points]
+        visible = frustum_plane_visibility(self.basic_planes, 1, fps[None], [0.,0.], [1.,1.])
+        self.assertTrue((visible == torch.tensor([True])).all())
 
-    map_dim = 32
-    planes = make_planes(plane_points, resolution=0.5)
+        fps = frustum_points(Camera(
+            size=torch.tensor([1., 1.]),
+            f=torch.tensor([0.5, 0.5]),
+            c=torch.tensor([0.5, 0.5]),
+            t=torch.tensor([0.5, 0.5, 2.0]),
+            R=torch.diag(torch.ones(3))
+        ), 0.1, 0.4)
+
+        visible = frustum_plane_visibility(self.basic_planes, 1, fps[None], [0.,0.], [1.,1.])
+        self.assertTrue((visible == torch.tensor([False])).all())
 
 
-    PlanesTest().test_project_sparse()
-    plt.show()

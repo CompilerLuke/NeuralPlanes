@@ -2,12 +2,14 @@ import torch
 from torch import nn
 from typing import Tuple
 import rectangle_packing_solver as rps
+from NeuralPlanes.camera import frustum_normals
+from matplotlib import pyplot as plt
 
 class Planes(nn.Module):
     x0s: torch.Tensor # (n,3)
     us: torch.Tensor # (n,3)
     vs: torch.Tensor # (n,3)
-    planes: torch.Tensor # (n,4)
+    planes: torch.Tensor # (n,4), todo: seperate normal and offset
     coord_x0: torch.Tensor # (n,2)
     coord_size: torch.Tensor # (n,2) 
 
@@ -29,7 +31,10 @@ class Planes(nn.Module):
         return self.x0s.shape[0]
 
 
-def ray_trace(planes: Planes, origin: torch.Tensor, dir: torch.Tensor, indices: torch.Tensor = None, eps=1e-9, max_dist=300) -> torch.Tensor:
+def ray_trace(planes: Planes, origin: torch.Tensor, dir: torch.Tensor, indices: torch.Tensor = None, mask: torch.Tensor = None, eps=1e-9, max_dist=300) -> torch.Tensor:
+    if not indices is None and len(indices) == 0:
+        return torch.full((origin.shape[0],), torch.inf), torch.zeros((origin.shape[0],))
+
     dir = dir / torch.linalg.norm(dir, dim=1).unsqueeze(1)
     normal = planes.planes[:,0:3]
     thr = planes.planes[:,3]
@@ -53,7 +58,9 @@ def ray_trace(planes: Planes, origin: torch.Tensor, dir: torch.Tensor, indices: 
     t = torch.where(mask, t, torch.tensor(torch.inf, device=device))
 
     if not indices is None:
-        t = t[:, indices]
+        t = t[:, indices] # todo: index earlier
+    if not mask is None:
+        t = torch.where(mask, t, torch.tensor(torch.inf))
 
     return torch.min(t, dim=1)
 
@@ -146,7 +153,7 @@ def project_to_planes_sparse(planes, pos, stride=8):
     return pixel_ids, plane_ids, coord
 
 
-def draw_planes(ax, planes, res=10, indices=None):
+def draw_planes(ax, planes, res=10, indices=None, color=None):
     xs = []
     ys = []
 
@@ -155,16 +162,23 @@ def draw_planes(ax, planes, res=10, indices=None):
 
     for i in indices:
         width, height = planes.coord_size[i]
-        u, v = torch.meshgrid(torch.linspace(0,1,int(width)), torch.linspace(0,1,int(height)))
+        v, u = torch.meshgrid(torch.linspace(0,1,int(height)), torch.linspace(0,1,int(width)))
 
         x0,u_dir,v_dir = planes.x0s[i], planes.us[i], planes.vs[i]
 
         x = x0.reshape((1,1,3)) + u_dir.reshape((1,1,3))*u.unsqueeze(2) + v_dir.reshape((1,1,3))*v.unsqueeze(2)
-    
-        ax.plot_surface(x[:,:,0], x[:,:,1], x[:,:,2])
+
+        if len(color.shape) == 2:
+            color = plt.cm.viridis(color)
+        else:
+            color = color.permute(1,2,0)
+        ax.plot_surface(x[:,:,0], x[:,:,1], x[:,:,2], facecolors= color)
 
 def make_planes(plane_points, resolution=1):
+    few_planes = 5
+
     x0,x1,x2 = plane_points
+    n = x0.shape[0]
 
     normal = torch.cross(x1-x0, x2-x0, dim=1)
     normal = normal / torch.linalg.norm(normal, dim=1).unsqueeze(1)
@@ -179,13 +193,27 @@ def make_planes(plane_points, resolution=1):
     us = x1 - x0 
     vs = x2 - x1
 
-    problem = rps.Problem(rectangles=map_size.tolist())
-    floor_map_size = map_size[0]
-    solution = rps.Solver().solve(problem=problem, show_progress=True, width_limit=floor_map_size[0])
+    if resolution == 0:
+        map_coords_x0 = None
+        map_coords_size = None
+        map_size = None
+    elif n < few_planes:
+        y = torch.cat([torch.zeros(1), torch.cumsum(map_size[:,1],0)], dim=0)
+        x = torch.zeros(n)
 
-    map_coords_x0 = torch.tensor([[int(rect['x']), int(rect['y'])] for rect in solution.floorplan.positions], requires_grad=False)
-    map_coords_size = torch.tensor([[int(rect['width']), int(rect['height'])] for rect in solution.floorplan.positions], requires_grad=False)
-    map_size = [int(x) for x in solution.floorplan.bounding_box]
+        width = torch.max(map_size[:,0])
+        height = y[-1]
+        map_coords_x0 = torch.stack([x, y[:-1]], dim=1).type(torch.int)
+        map_coords_size = map_size.type(torch.int)
+        map_size = (int(width), int(height))
+    else:
+        problem = rps.Problem(rectangles=map_size.tolist())
+        floor_map_size = map_size[0]
+        solution = rps.Solver().solve(problem=problem, show_progress=True, width_limit=floor_map_size[0])
+
+        map_coords_x0 = torch.tensor([[int(rect['x']), int(rect['y'])] for rect in solution.floorplan.positions], requires_grad=False)
+        map_coords_size = torch.tensor([[int(rect['width']), int(rect['height'])] for rect in solution.floorplan.positions], requires_grad=False)
+        map_size = [int(x) for x in solution.floorplan.bounding_box]
 
     planes = Planes(
         x0s= x0,
@@ -197,3 +225,73 @@ def make_planes(plane_points, resolution=1):
         atlas_size=map_size
     )
     return planes
+
+
+"""
+Work-around for current limitation of vmap, calling .item() on a Tensor is not supported
+"""
+def index_1d(vec, id):
+    if type(id) is int:
+        return vec[id]
+    return torch.gather(vec, 0, id.unsqueeze(0).repeat(1, vec.shape[1]), sparse_grad=True).squeeze(0)
+
+
+def plane_box_points(planes: Planes, plane_id: int, rel_x0: torch.Tensor = None, rel_x1: torch.Tensor = None, max_dist=100.0, perp_thr=0.1):
+    plane_normal = index_1d(planes.planes, plane_id)[0:3]
+
+    rel_x0 = rel_x0 if not rel_x0 is None else (0,0)
+    rel_x1 = rel_x1 if not rel_x1 is None else (1,1)
+
+    x0, u, v = index_1d(planes.x0s, plane_id), index_1d(planes.us, plane_id), index_1d(planes.vs, plane_id)
+
+    plane_points_base = torch.stack([
+        x0 + u*rel_x0[0] + v*rel_x0[1],
+        x0 + u*rel_x1[0] + v*rel_x0[1],
+        x0 + u*rel_x1[0] + v*rel_x1[1],
+        x0 + v*rel_x0[0] + v*rel_x1[1]
+    ])
+
+    perp_mask = torch.abs(torch.einsum("j,ij->i", plane_normal, planes.planes[:,0:3])) < perp_thr
+
+    mask = (~perp_mask) & (torch.arange((len(planes))) != plane_id)
+
+    # note: current limitation of vmap prevents us from skipping calculations using indices, have to use mask instead
+    dist_to_intersec, inter_indices = ray_trace(planes, plane_points_base + plane_normal[None], plane_normal[None].repeat(4,1), mask=mask)
+
+    print("intersection indices", dist_to_intersec, inter_indices)
+    dist = torch.minimum(torch.tensor(max_dist), dist_to_intersec)
+
+    plane_points_top = plane_points_base + plane_normal[None] * dist[:,None]
+    return torch.cat([plane_points_base, plane_points_top], dim=0)
+
+def single_frustum_single_plane_visibility(planes: Planes, plane_id: int, frustum_points: torch.Tensor, rel_x0, rel_x1):
+    plane_normal = index_1d(planes.planes, plane_id)[0:3]
+
+        #planes.planes[plane_id, 0:3]
+    plane_points = plane_box_points(planes, plane_id, rel_x0, rel_x1)
+
+    # Frustum normals
+    axes_frustum = frustum_normals(frustum_points)
+
+    # Box extruded from plane
+    axes_box = torch.stack([index_1d(planes.us, plane_id), index_1d(planes.vs, plane_id), plane_normal])
+
+    axes = torch.cat([axes_frustum, axes_box], dim=0)
+
+    frustum_proj = torch.einsum("ik,jk->ij", axes, frustum_points.reshape((8, 3)))
+    frustum_proj0 = torch.min(frustum_proj, dim=1)[0]
+    frustum_proj1 = torch.max(frustum_proj, dim=1)[0]
+
+    plane_proj = torch.einsum("ik,jk->ij", axes, plane_points)
+    plane_proj0 = torch.min(plane_proj, dim=1)[0]
+    plane_proj1 = torch.max(plane_proj, dim=1)[0]
+
+    line_intersect = ((frustum_proj0 <= plane_proj0) & (plane_proj0 <= frustum_proj1)) \
+                     | ((plane_proj0 <= frustum_proj0) & (frustum_proj0 <= plane_proj1))
+
+    intersect = torch.all(line_intersect, dim=0)
+    return intersect
+
+frustum_plane_visibility = torch.vmap(single_frustum_single_plane_visibility, in_dims=(None,None,0,None,None), out_dims=0)
+
+single_frustum_multiple_plane_visibility = torch.vmap(single_frustum_single_plane_visibility, in_dims=(None,0,None,0,0), out_dims=0)

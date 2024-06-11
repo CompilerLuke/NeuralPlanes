@@ -1,7 +1,7 @@
 import torch 
 from torch import nn
 from NeuralPlanes.camera import Camera
-from NeuralPlanes.volume import raytrace_volume, alpha_weight, alpha_blend
+from NeuralPlanes.nerf.volume import raytrace_volume
 
 
 class ColorDecoder(nn.Module):

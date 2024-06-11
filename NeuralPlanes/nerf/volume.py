@@ -42,6 +42,7 @@ def sample_ray(origin, dir, min_t, max_t, samples, xs=None, ys=None): # Returns 
 
     return origin[:,None] + t[:,:-1,:,:,None]*dir[:,None], t[:, :-1, :, :], t[:, 1:,:,:] - t[:, :-1,:,:]
 
+
 def raytrace_volume(planes, min_depth, max_depth, res, camera: Union[List[Camera], Camera], atlas, decoder, density_decoder, alpha_xs, alpha_ys):
     width,height,depth_steps = res
     device = atlas.device
@@ -66,8 +67,6 @@ def raytrace_volume(planes, min_depth, max_depth, res, camera: Union[List[Camera
     map_dim = features.shape[0]
 
     combined_features = torch_scatter.scatter_add(dim=1, index=pixel_ids, src=features, dim_size=batch_size*depth*height*width)
-    #torch.zeros((map_dim, batch_size*depth*height*width), device=device).scatter_add(dim=1, index=pixel_ids[None,:].repeat(3,1), src=features)
-    #torch.ones((map_dim, batch_size*depth*height*width), device=device).scatter_reduce(dim=1, index=pixel_ids[None,:], src=features, include_self=True, reduce='sum')
 
     values = decoder(combined_features.transpose(0,1)) # (bxdxhxw, c)
     values = values.reshape((batch_size, depth, height, width, -1)) # (b,d,h,w, c)
