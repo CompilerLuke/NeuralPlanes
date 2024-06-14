@@ -1,10 +1,12 @@
 from NeuralPlanes import gmm
+from NeuralPlanes.localization.map import NeuralMapConf
 import torch
 
 
-def pool_images(masks, images, occupancy, t, weight_init=None, mu_init=None, var_init=None):
-    n_components = 4
+def pool_images(map_conf: NeuralMapConf, masks, images, occupancy, t, weight_init=None, mu_init=None, var_init=None):
+    n_components = map_conf.num_components
     n_features,n_height,n_width,n_len = images.shape
+    device = images.device
 
     def gaussian_mixture(mask, values, occupancy, mu_init, var_init):
         g = gmm.GaussianMixture(n_components=n_components, n_features=n_features, mu_init=mu_init[None], var_init=var_init[None], covariance_type="diag")
@@ -19,7 +21,10 @@ def pool_images(masks, images, occupancy, t, weight_init=None, mu_init=None, var
         #var: torch.Tensor(1, k, d) or (1, k, d, d)
         #pi: torch.Tensor(1, k, 1)
 
-        return cell_weight, g.pi.squeeze(0).squeeze(1), g.mu.squeeze(0), g.var.squeeze(0)
+        zero = torch.tensor(0.,device=device)
+        one = torch.tensor(1.,device=device)
+        mask = cell_weight > 0
+        return cell_weight, torch.where(mask,  g.pi.squeeze(0).squeeze(1), one/n_components), torch.where(mask, g.mu.squeeze(0), zero), torch.where(mask, g.var.squeeze(0), one)
 
     def initial_params(mask, values, occupancy):
         indices = torch.multinomial(occupancy+1e-9, n_components, replacement= n_components >= len(occupancy))

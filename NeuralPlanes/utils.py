@@ -1,11 +1,12 @@
 import torch
 from torchvision.transforms import v2
+import os
+import cv2
+from pathlib import Path
 
 torch.set_float32_matmul_precision('high')
 
 def select_device():
-    return 'cpu'
-
     if torch.cuda.is_available():
         return 'cuda'
     if torch.backends.mps.is_available():

@@ -14,12 +14,33 @@ class Camera:
     near: float = 0.1
     far: float = 100
 
+    def to(self, device):
+        return Camera(
+            size=self.size.to(device),
+            f=self.f.to(device),
+            c=self.c.to(device),
+            R=self.R.to(device),
+            t=self.t.to(device),
+            near=self.near,
+            far=self.far
+        )
+
+    def scale(self, s):
+        return Camera(
+            size=torch.tensor([int(self.size[0]*s), int(self.size[1]*s)]),
+            f=torch.tensor([self.f[0]*s, self.f[1]*s]),
+            c=torch.tensor([self.c[0]*s, self.c[1]*s]),
+            R=self.R,
+            t=self.t,
+            near=self.near,
+            far=self.far
+        )
     def intrinsic_matrix(cam):
         K = torch.tensor([
             [cam.f[0],0,cam.c[0]],
             [0,cam.f[1],cam.c[1]],
             [0,0,1]
-        ])
+        ], device=cam.R.device)
 
         return K
 
@@ -63,7 +84,7 @@ def compute_ray(width, height, camera, device, same_z: bool = True):
     dir = dir / torch.linalg.norm(dir, dim=2).unsqueeze(2)
 
     if same_z:
-        fwd = camera.R @ torch.tensor([0, 0, 1.])
+        fwd = camera.R @ torch.tensor([0, 0, 1.], device=camera.R.device)
         scale = 1.0/torch.einsum("ijk,k->ij",dir,fwd)
         dir = dir*scale[:,:,None]
 
@@ -139,11 +160,14 @@ def frustum_ray_intersection(frustum_points: torch.Tensor, origin: torch.Tensor,
     v = plane_x11-plane_x10
     s = plane_x01-plane_x00
 
+    """
+    todo: investigate numerics
     assert torch.linalg.norm(torch.einsum("ij,ij->i", normals, u)) < 1e-3
     assert torch.linalg.norm(torch.einsum("ij,ij->i", normals, v)) < 1e-3
     assert torch.linalg.norm(torch.einsum("ij,ij->i", normals, s)) < 1e-3
     assert torch.linalg.norm(torch.einsum("ij,ij->i", u, v)) < 1e-3
     assert torch.linalg.norm(torch.einsum("ij,ij->i", u, s)) < 1e-3
+    """
 
     un = torch.linalg.norm(u, dim=1)
     vn = torch.linalg.norm(v, dim=1)

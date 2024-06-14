@@ -33,13 +33,15 @@ class NeuralMap(nn.Module):
     def __init__(self, planes: Planes, atlas_alpha: torch.Tensor, atlas_mu: torch.Tensor, atlas_var: torch.Tensor, atlas_weight: torch.Tensor, conf: NeuralMapConf):
         super().__init__()
 
+        device = atlas_alpha.device
+
         self.planes = planes
         self.atlas_alpha = torch.nn.Parameter(atlas_alpha)
         self.atlas_mu = torch.nn.Parameter(atlas_mu)
         self.atlas_var = torch.nn.Parameter(atlas_var)
         self.atlas_weight = torch.nn.Parameter(atlas_weight)
         self.conf = conf
-        self.encoder = Encoder(conf.num_features_backbone, conf.num_features)
+        self.encoder = Encoder(conf.num_features_backbone, conf.num_features).to(device)
 
     def n_components(self):
         return self.atlas_mu.shape[0]
