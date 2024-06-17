@@ -152,10 +152,10 @@ def load_keypoint_database(paths) -> LocalFeatures:
     )
 
 
-def train_nerf(planes, map_module):
-    building_path = "../data/HG_navviz/"
+def train_nerf():
+    building_path = "../../data/HG_navviz/"
     floor_plan_path = building_path + "raw_data/floor_plan/"
-    train_path = "../data/train_HG/"
+    train_path = "../../data/train_HG/"
 
     trajectories = parse_trajectories(building_path + "trajectories.txt")
     floor_plan_img, plane_points = parse_floorplan(floor_plan_path)
@@ -182,4 +182,4 @@ def train_nerf(planes, map_module):
 
 
 if __name__ == "__main__":
-    pass
+    train_nerf()

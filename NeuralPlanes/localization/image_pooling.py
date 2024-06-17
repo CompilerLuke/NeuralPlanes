@@ -10,7 +10,7 @@ def pool_images(masks, images, occupancy, t, weight_init=None, mu_init=None, var
         g = gmm.GaussianMixture(n_components=n_components, n_features=n_features, mu_init=mu_init[None], var_init=var_init[None], covariance_type="diag")
 
         image_weight = occupancy / (1e-9 + torch.sum(occupancy))
-        g.fit(image_weight.unsqueeze(1), values, n_iter=10)
+        g.fit(image_weight.unsqueeze(1), values, n_iter=4)
 
         cell_weight = torch.max(occupancy)
 

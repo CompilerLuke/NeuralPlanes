@@ -101,7 +101,7 @@ class MapBuilderTest(unittest.TestCase):
                                                          [1, 1]]])))
 
     def test_assign_cameras_to_planes(self):
-        builder = NeuralMapBuilder(planes=self.basic_planes, image_ids=self.image_ids, cameras=self.cameras,
+        builder = NeuralMapBuilder(planes=self.basic_planes, cameras=self.cameras,
                                    conf=self.builder_conf)
         builder._assign_cameras_to_planes()
 
@@ -133,9 +133,8 @@ class MapBuilderTest(unittest.TestCase):
         return image_cos, depth
 
     def test_sample_images(self):
-        builder = NeuralMapBuilder(planes=self.basic_planes, image_ids=self.image_ids, cameras=self.cameras,
+        builder = NeuralMapBuilder(planes=self.basic_planes, cameras=self.cameras,
                                    conf=self.builder_conf)
-        builder.init()
 
         width,height = 10, 10
         image, depth = self.gen_cos_image()
@@ -146,7 +145,7 @@ class MapBuilderTest(unittest.TestCase):
 
         camera = self.forward_cam
 
-        masks, image_values, occupancy, tsamples, out_pos = builder.sample_images(chunk_id, [image], [depth], [camera])
+        masks, image_values, occupancy, tsamples, out_pos = builder.sample_images(chunk_id, [image.to(builder.device)], [depth.to(builder.device)], [camera.to(builder.device)])
 
         weight,alpha,mu,var = pool_images(masks, image_values, occupancy, tsamples)
 
@@ -165,15 +164,15 @@ class MapBuilderTest(unittest.TestCase):
 
         print(masks.shape, image_values.shape, occupancy.shape, out_pos.shape)
 
-        pos = out_pos[masks]
+        pos = out_pos[masks].cpu()
         ax.scatter(pos[:,0], pos[:,1], pos[:,2])
 
-        fp = frustum_points(camera).reshape((8,3))
+        fp = frustum_points(camera).reshape((8,3)).cpu()
         ax.scatter(fp[:,0],fp[:,1],fp[:,2])
 
         plt.show()
 
-        print(list(samples))
+
 
     def test_scoring(self):
         planes = self.basic_planes
@@ -218,7 +217,7 @@ class MapBuilderTest(unittest.TestCase):
         plt.show()
 
     def test_training_dryrun(self):
-        builder = NeuralMapBuilder(planes=self.basic_planes, image_ids=self.image_ids, cameras=self.cameras,
+        builder = NeuralMapBuilder(planes=self.basic_planes,cameras=self.cameras,
                                    conf=NeuralMapBuilderConf(
                                        num_features=1,
                                        num_features_backbone=1,
@@ -226,7 +225,8 @@ class MapBuilderTest(unittest.TestCase):
                                            num_ref_kps=4,
                                            kp_per_ref=2,
                                            ransac_it=1,
-                                           ransac_sample=4
+                                           ransac_sample=4,
+                                           scale_factor=1,
                                        )
                                    ))
 
@@ -236,10 +236,6 @@ class MapBuilderTest(unittest.TestCase):
 
         depth = torch.full((height, width,), 0.5)
 
-        image_db = {
-            'cam_A': {'feature': image_cos, 'depth': depth},
-            'cam_B': {'feature': image_cos, 'depth': depth}
-        }
 
-        builder.train(image_db)
+        builder.train([{"image": image_cos},{"image": image_cos}], [{"image": depth}, {"image": depth}])
 

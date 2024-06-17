@@ -113,11 +113,13 @@ class GaussianMixture:
         self._init_params()
 
     def _init_params(self):
+        device = 'cpu'
         if self.mu_init is not None:
             assert self.mu_init.size() == (1, self.n_components,
                                            self.n_features), "Input mu_init does not have required tensor dimensions (1, %i, %i)" % (
             self.n_components, self.n_features)
             # (1, k, d)
+            device = self.mu_init.device
             self.mu = self.mu_init
         else:
             self.mu = torch.randn(1, self.n_components, self.n_features)
@@ -147,10 +149,13 @@ class GaussianMixture:
         if self.pi_init is not None:
             self.pi = self.pi_init
         else:
-            self.pi = torch.Tensor(1, self.n_components, 1).fill_(1. / self.n_components)
+            self.pi = torch.full((1, self.n_components, 1), 1. / self.n_components, device=device)
         self.params_fitted = False
 
     def check_size(self, x):
+        if len(x.size()) == 1:
+            # (n) --> (n, 1, d)
+            return x[:,None,None]
         if len(x.size()) == 2:
             # (n, d) --> (n, 1, d)
             x = x.unsqueeze(1)
@@ -391,7 +396,7 @@ class GaussianMixture:
         x = self.check_size(x)
         w = self.check_size(w)
 
-        resp = w * torch.exp(log_resp)
+        resp = (w) * torch.exp(log_resp)
 
         pi = torch.sum(resp, dim=0, keepdim=True) + self.eps
         mu = torch.sum(resp * x, dim=0, keepdim=True) / pi
@@ -407,7 +412,7 @@ class GaussianMixture:
             xmu = (resp * mu * x).sum(0, keepdim=True) / pi
             var = x2 - 2 * xmu + mu2 + self.eps
 
-        pi = pi / x.shape[0]
+        #pi = pi / x.shape[0]
 
         return pi, mu, var
 
@@ -436,13 +441,13 @@ class GaussianMixture:
             per_sample_score:   torch.Tensor (n)
 
         """
-        weighted_log_prob = self._estimate_log_prob(x, normalize=normalize) + torch.log(self.pi)
-        per_sample_score = torch.logsumexp(weighted_log_prob, dim=1)
+        weighted_log_prob = self._estimate_log_prob(x, normalize=normalize) + torch.log(self.pi + 1e-9)
+        per_sample_score = torch.logsumexp(weighted_log_prob + 1e-9, dim=1)
 
         if as_average:
-            return (torch.log(w) + per_sample_score).sum()
+            return (w*per_sample_score).sum()
         else:
-            return torch.squeeze(torch.log(w) + per_sample_score)
+            return per_sample_score.squeeze(0)
 
     def __update_mu(self, mu):
         """
