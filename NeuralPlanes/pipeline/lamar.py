@@ -309,7 +309,10 @@ def parse_floorplan(floor_plan_path):
     for polygon in planes_json:
         contour = torch.stack([torch.tensor([p["x"], p["y"]]) for p in polygon["content"]])
         contour = torch.cat([contour, contour[0].unsqueeze(0)], dim=0)
-        contour = torch.flip(contour, dims=(0,))
+
+        if polygon["labels"]["labelName"] == "in":
+            print("flip")
+            contour = torch.flip(contour, dims=(0,))
 
         n = contour.shape[0]
 
@@ -429,9 +432,8 @@ def downsize_images(out_dir, images: Images, max_size, dataloader_conf):
             path.parent.mkdir(parents=True, exist_ok=True)
             error = io.imsave(str(path), image)
 
-def load_map():
+def load_map(model_checkpoint):
     device = select_device()
-    model_checkpoint = "checkpoint/model.pt"
     conf = NeuralMapConf(num_components=4, num_features_backbone=21, num_features=8, depth_sigma=0.2)
     encoder = Unet(encoder_freeze=True, classes= conf.num_features+1)
 
@@ -457,10 +459,9 @@ def load_map():
 def gen_planes_from_floorplan(lamar_path):
     floor_plan_img, plane_points, floorplan_to_world = parse_floorplan(lamar_path / "floor_plan")
 
-    fig, ax = plt.subplots()
-
     plot_planes = False 
     if plot_planes:
+        fig, ax = plt.subplots()
         plot_image_poses(fig, ax, images)
         plot_floor_planes(fig, ax, plane_points)
         plt.show()
@@ -475,6 +476,7 @@ if __name__ == "__main__":
                     description='',
                     epilog='')
     parser.add_argument('directory')
+
     args = parser.parse_args()
     
     lamar_path = Path(args.directory)
@@ -486,6 +488,7 @@ if __name__ == "__main__":
     session_map_path_precompute = lamar_path / "sessions" / ("map_precompute_"+str(max_size))
     session_map_path_depth = session_map_path_precompute / "depth"
     session_map_path_small = session_map_path_precompute / "small_images"
+    model_checkpoint = "checkpoint/model.pt"
 
     images = parse_session(session_map_path, lambda path: path.startswith("ios"))
 
@@ -494,7 +497,7 @@ if __name__ == "__main__":
     dataloader_conf = DataloaderConf(
         batch_size=16,
         cache_size=64,
-        num_workers=8
+        num_workers=0
     )
 
     if os.path.exists(session_map_path_depth):
@@ -511,9 +514,9 @@ if __name__ == "__main__":
 
     map_builder_conf = NeuralMapBuilderConf(num_components=4, num_features_backbone=0, num_features=8, num_epochs=1, max_views_per_chunk=20, depth_sigma=0.2, chunk_size=32, ransac=RansacMiningConf(num_ref_kps=20, kp_per_ref=10, ransac_it=15, ransac_sample=10, top_k=5))
 
-    load_checkpoint = True
+    load_checkpoint = os.path.exists(model_checkpoint)
     if load_checkpoint:
-        map = load_map()
+        map = load_map(model_checkpoint)
         encoder = map.encoder
         builder = NeuralMapBuilder(map=map, cameras=cameras, conf=map_builder_conf)
     else:

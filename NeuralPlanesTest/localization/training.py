@@ -41,7 +41,7 @@ class MapBuilderTest(unittest.TestCase):
         ]
 
         self.image_ids = ["cam_A", "cam_B"]
-        self.builder_conf = NeuralMapBuilderConf(chunk_size=100, depth_sigma=0.2, num_components=1, num_features=1)
+        self.builder_conf = NeuralMapBuilderConf(chunk_size=100, depth_sigma=0.2, num_components=1, num_features=1, cluster_ratio=1.0)
 
         R = Rotation.from_rotvec([-90.0,0.0,0.0], degrees=True).as_matrix()
         R = torch.tensor(R,dtype=torch.float)
@@ -67,7 +67,7 @@ class MapBuilderTest(unittest.TestCase):
 
         coord, size = builder._chunk_neural_map(0)
 
-        self.assertTrue(torch.allclose(coord, torch.tensor([[[0, 0],
+        self.assertTrue(torch.allclose(coord.cpu(), torch.tensor([[[0, 0],
                                                          [3, 0],
                                                          [6, 0],
                                                          [9, 0]],
@@ -83,7 +83,7 @@ class MapBuilderTest(unittest.TestCase):
                                                          [3, 9],
                                                          [6, 9],
                                                          [9, 9]]])))
-        self.assertTrue(torch.allclose(size, torch.tensor([[[3, 3],
+        self.assertTrue(torch.allclose(size.cpu(), torch.tensor([[[3, 3],
                                                          [3, 3],
                                                          [3, 3],
                                                          [1, 3]],
@@ -135,7 +135,7 @@ class MapBuilderTest(unittest.TestCase):
     def gen_cos_image(self, height=10, width=10):
         v, u = torch.meshgrid(torch.linspace(0, 1, height), torch.linspace(0, 1, width))
         importance = torch.ones((1,height,width))
-        image_cos = torch.stack([0.5*torch.cos(torch.pi * u)+0.5]) # * torch.cos(torch.pi * v)
+        image_cos = torch.stack([torch.cos(torch.pi * u)])
         depth = torch.full((height, width,), 0.5)
 
         return torch.cat([importance, image_cos], dim=0), depth
@@ -155,7 +155,7 @@ class MapBuilderTest(unittest.TestCase):
 
         masks, image_values, occupancy, tsamples, out_pos = builder.sample_images(chunk_id, [image.to(builder.device)], [depth.to(builder.device)], [camera.to(builder.device)])
 
-        weight,alpha,mu,var = pool_images(builder.map.conf, masks, image_values, occupancy, tsamples)
+        weight,alpha,mu,var = pool_images(builder.map, masks, image_values, occupancy, tsamples)
 
 
         fig = plt.figure()
@@ -168,7 +168,7 @@ class MapBuilderTest(unittest.TestCase):
         print(weight)
         print("Weight range", )
 
-        draw_planes(ax, self.basic_planes, indices=[0], color= weight) #torch.where(weight > 0.9, mu[0,0], torch.zeros((height,width))))
+        draw_planes(ax, self.basic_planes, indices=[0], color= weight) # torch.where(weight > 0.1, mu[0,0], torch.zeros((height,width),device=weight.device)))
 
         print(masks.shape, image_values.shape, occupancy.shape, out_pos.shape)
 
@@ -188,7 +188,7 @@ class MapBuilderTest(unittest.TestCase):
         n_components = 1
         n_features = 1
         atlas_height, atlas_width = planes.atlas_size
-        atlas_mu = torch.zeros((n_components, n_features, atlas_height, atlas_width))
+        atlas_mu = torch.ones((n_components, n_features, atlas_height, atlas_width))
         atlas_var = torch.ones((n_components, n_features, atlas_height, atlas_width))
         atlas_alpha = torch.ones((n_components, atlas_height, atlas_width))
         atlas_weight = torch.ones((n_components, atlas_height, atlas_width))
@@ -208,7 +208,7 @@ class MapBuilderTest(unittest.TestCase):
         score_cos = score_pose(map, camera, image_cos, depth)
         score_one = score_pose(map, camera, image_outlier, depth)
 
-        self.assertGreater(score_zero, score_cos)
+        self.assertGreater(score_one, score_cos)
 
         print(score_zero, score_cos, score_one)
 
@@ -227,7 +227,8 @@ class MapBuilderTest(unittest.TestCase):
     def test_training_dryrun(self):
         builder = NeuralMapBuilder(planes=self.basic_planes,cameras=self.cameras,
                                    conf=NeuralMapBuilderConf(
-                                       num_features=1,
+                                       num_features=2,
+                                       num_components=3,
                                        num_features_backbone=1,
                                        ransac=RansacMiningConf(
                                            num_ref_kps=4,

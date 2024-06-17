@@ -8,6 +8,7 @@ import numpy as np
 import copy
 import logging
 from math import ceil, floor
+from typing import List
 
 log = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class RansacMiningConf:
     scale_factor: float = 1.0 / 8
 
 
-def mine_negatives(map: NeuralMap, floor_plane: int, rel_x0: torch.Tensor, rel_x1: torch.Tensor, camera: Camera, image, depths, conf: RansacMiningConf):
+def mine_negatives(map: NeuralMap, floor_plane: int, rel_x0: torch.Tensor, rel_x1: torch.Tensor, camera: Camera, negative_cameras: List[Camera], image: torch.Tensor, depths: torch.Tensor, conf: RansacMiningConf):
     device = image.device
     plane_indices = torch.tensor([floor_plane])
 
@@ -78,25 +79,31 @@ def mine_negatives(map: NeuralMap, floor_plane: int, rel_x0: torch.Tensor, rel_x
     height,width = int(ceil(u1*plane_width)-floor(u0*plane_width)), int(ceil(v1*plane_height)-floor(v0*plane_height))
     print("Map size searched ", height, width, u0, u1, v0, v1)
     v,u = torch.meshgrid(torch.linspace(v0,v1,height,device=device), torch.linspace(u0,u1,width,device=device))
-    coords = torch.stack([u.flatten(),v.flatten()], dim=1)
+    coords = torch.stack([u.flatten(),v.flatten(),torch.zeros_like(u).flatten()], dim=1)
     n_coords = coords.shape[0]
 
     def score_cell_per_feature(feature):
         # todo: avoid repeating feature and broadcast directly
-        log_prob, weight = score_cells(map, plane_indices.to(device), coords[None], feature[:,None].repeat(1,n_coords), torch.ones((n_coords), device=device), x0= rel_x0[None], x1= rel_x1[None])
-        return torch.exp(log_prob[0]) * weight[0]
+        score, weight = score_cells(map, plane_indices.to(device), coords[None], feature[:,None].repeat(1,n_coords), torch.ones((n_coords), device=device), x0= rel_x0[None], x1= rel_x1[None])
+        return score[0] # get score for single plane
 
     score_matrix = torch.vmap(score_cell_per_feature, in_dims=1)(features_ref_kp)
     indices_match = torch.topk(score_matrix, k=kp_per_ref, dim=1)[1]
 
-    negatives = torch.zeros(conf.ransac_it, device=device)
-    negatives_count = 0
+    def eval_model(new_cam, scale_depth=1.0):
+        score, weight = score_pose(map, new_cam, image, scale_depth*depths, rel_x0=rel_x0[None], rel_x1=rel_x1[None], plane_indices=plane_indices)
+        return score
+
+    negatives = torch.zeros(conf.ransac_it+len(negative_cameras), device=device)
+    negatives_count = len(negative_cameras)
+    if negatives_count > 0:
+        negatives[:negatives_count] = torch.stack([eval_model(new_cam) for new_cam in negative_cameras]) # todo: batch
 
     x0 = x0.to(device)
     un = un.to(device)
     vn = vn.to(device)
-    rel_to_abs_coord = torch.stack([us_len, vs_len]).to(device)
-    camera_pos_plane_basis = torch.stack([ torch.dot(un, camera.t - x0), torch.dot(vn, camera.t-x0) ])
+    rel_to_abs_coord = torch.stack([us_len, vs_len, torch.ones_like(us_len)]).to(device)
+    camera_pos_plane_basis = torch.stack([ torch.dot(un, camera.t - x0), torch.dot(vn, camera.t-x0), torch.dot(normal, camera.t-x0) ])
     #, camera_v = camera.t - torch.linalg.norm(camera.t,normal)*normal 
 
     for i in range(conf.ransac_it):
@@ -105,13 +112,14 @@ def mine_negatives(map: NeuralMap, floor_plane: int, rel_x0: torch.Tensor, rel_x
         sample_ref_kp = torch.randperm(num_ref_kps)[:sample]
         sample_matching_kp = torch.randint(0, kp_per_ref, (sample,))
 
+        # todo: use z coordinate from matching
         match_coords = coords[indices_match[sample_ref_kp, sample_matching_kp]]
 
         # Coordinate in plane basis, with origin at camera
         match_pos = match_coords * rel_to_abs_coord[None,:] - camera_pos_plane_basis
         
         ref_pos = pos_ref_kp[sample_ref_kp]
-        ref_pos =  torch.stack([torch.einsum("j,ij->i", un, ref_pos-x0), torch.einsum("j,ij->i", vn, ref_pos-x0)],dim=1) - camera_pos_plane_basis
+        ref_pos =  torch.stack([torch.einsum("j,ij->i", un, ref_pos-x0), torch.einsum("j,ij->i", vn, ref_pos-x0), torch.einsum("j,ij->i",normal,ref_pos-x0)],dim=1) - camera_pos_plane_basis
 
         """
         if floor_plane==0:
@@ -122,8 +130,8 @@ def mine_negatives(map: NeuralMap, floor_plane: int, rel_x0: torch.Tensor, rel_x
             assert torch.isclose(match_pos, match_pos2).all() and torch.isclose(ref_pos, ref_pos2).all()
         """
 
-        match_pos = match_pos.cpu().detach().numpy().astype(float)
-        ref_pos = ref_pos.cpu().detach().numpy().astype(float)
+        match_pos = match_pos[:,0:2].cpu().detach().numpy().astype(float)
+        ref_pos = ref_pos[:,0:2].cpu().detach().numpy().astype(float)
 
         #print("Computing affine transformation")
         matrix, inliers = cv2.estimateAffinePartial2D(ref_pos, match_pos, ransacReprojThreshold=0.2)
@@ -160,9 +168,9 @@ def mine_negatives(map: NeuralMap, floor_plane: int, rel_x0: torch.Tensor, rel_x
         new_cam.t = camera.t + delta_t
 
         #print("Scoring pose")
-        score, weight = score_pose(map, new_cam, image, depths * s)
+        score = eval_model(new_cam, s)
         if not torch.isfinite(score):
-            score_pose(map, camera, image, depths, dense=True, plane_indices=plane_indices, x0=rel_x0, x1=rel_x1)
+            eval_model(new_cam, s)
             print("Mined pose is not finite ", score)
             continue
 

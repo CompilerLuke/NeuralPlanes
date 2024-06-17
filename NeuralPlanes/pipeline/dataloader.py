@@ -135,7 +135,9 @@ class SequentialLoader:
         self.current_access = 0
         self.current_batch_number = -1
         self.batch_number = batch_number
-        self.dataloader = DataLoader(ReorderDataset(dataset=dataset, indices=load_items), prefetch_factor=cache_size//batch_size, num_workers=conf.num_workers, collate_fn=collate_fn, batch_size=conf.batch_size)
+        print("Creating dataloader")
+        self.dataloader = DataLoader(ReorderDataset(dataset=dataset, indices=load_items), num_workers=conf.num_workers, collate_fn=collate_fn, batch_size=conf.batch_size)
+        print("Created data loader")
         self.iterator = None
         self.load_items = load_items
         self.load_cache_slot_index = load_cache_slot_index
@@ -147,7 +149,10 @@ class SequentialLoader:
 
     def fetch_next_batch(self):
         current_batch_number = self.current_batch_number+1
+
+        print("Fetch next batch")
         data = next(self.iterator)
+        print("Fethced batch")
         if self.apply_fn:
             data = self.apply_fn(data)
         

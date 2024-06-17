@@ -166,7 +166,7 @@ def draw_planes(ax, planes, stride=None, indices=None, color=None):
 
     for i in indices:
         width, height = planes.coord_size[i]
-        v, u = torch.meshgrid(torch.linspace(0,1,int(height)//stride), torch.linspace(0,1,int(width)//stride))
+        v, u = torch.meshgrid(torch.linspace(0,1,int(height)//stride,device=planes.x0s.device), torch.linspace(0,1,int(width)//stride,device=planes.x0s.device))
 
         x0,u_dir,v_dir = planes.x0s[i], planes.us[i], planes.vs[i]
 
@@ -183,6 +183,7 @@ def draw_planes(ax, planes, stride=None, indices=None, color=None):
         ax.plot_surface(x[:,:,0], x[:,:,1], x[:,:,2], facecolors= color)
 
 def make_planes(plane_points, resolution=1):
+    print("MAKE PLANES")
     few_planes = 5
 
     x0,x1,x2 = plane_points
@@ -201,6 +202,8 @@ def make_planes(plane_points, resolution=1):
     us = x1 - x0 
     vs = x2 - x1
 
+    print("Generating planes")
+
     if resolution == 0:
         map_coords_x0 = None
         map_coords_size = None
@@ -217,11 +220,13 @@ def make_planes(plane_points, resolution=1):
     else:
         problem = rps.Problem(rectangles=map_size.tolist())
         floor_map_size = map_size[0]
-        solution = rps.Solver().solve(problem=problem, show_progress=True, width_limit=2*floor_map_size[0])
+        solution = rps.Solver().solve(problem=problem, show_progress=True, width_limit=3*floor_map_size[0])
 
         map_coords_x0 = torch.tensor([[int(rect['x']), int(rect['y'])] for rect in solution.floorplan.positions], requires_grad=False)
         map_coords_size = torch.tensor([[int(rect['width']), int(rect['height'])] for rect in solution.floorplan.positions], requires_grad=False)
         map_size = [int(x) for x in solution.floorplan.bounding_box]
+
+    print("Generated planes")
 
     planes = Planes(
         x0s= x0,
@@ -260,8 +265,9 @@ def plane_box_points(planes: Planes, plane_id: int, rel_x0: torch.Tensor = None,
     ])
 
     perp_mask = torch.abs(torch.einsum("j,ij->i", plane_normal, planes.planes[:,0:3])) < perp_thr
+    device = perp_mask.device
 
-    mask = (~perp_mask) & (torch.arange((len(planes))) != plane_id)
+    mask = (~perp_mask) & (torch.arange((len(planes)),device=device) != plane_id)
 
     # note: current limitation of vmap prevents us from skipping calculations using indices, have to use mask instead
     dist_to_intersec, inter_indices = ray_trace(planes, plane_points_base + plane_normal[None], plane_normal[None].repeat(4,1), mask=mask)

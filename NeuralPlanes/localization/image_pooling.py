@@ -1,9 +1,10 @@
 from NeuralPlanes import gmm
-from NeuralPlanes.localization.map import NeuralMapConf
+from NeuralPlanes.localization.map import NeuralMap, NeuralMapConf
 import torch
+from torch_kmeans import SoftKMeans
 
-
-def pool_images(map_conf: NeuralMapConf, masks, images, occupancy, t, weight_init=None, mu_init=None, var_init=None):
+def pool_images(map: NeuralMap, masks, images, occupancy, t, weight_init=None, mu_init=None, var_init=None):
+    map_conf = map.conf
     n_components = map_conf.num_components
     n_features = map_conf.num_features
     c,n_height,n_width,n_len = images.shape
@@ -11,66 +12,37 @@ def pool_images(map_conf: NeuralMapConf, masks, images, occupancy, t, weight_ini
 
     assert c == n_features+1
 
-    def gaussian_mixture(mask, values, occupancy, mu_init, var_init):
-        g = gmm.GaussianMixture(n_components=n_components, n_features=n_features, mu_init=mu_init[None], var_init=var_init[None], covariance_type="diag")
+    assert map_conf.cluster_ratio >= 1.0
 
-        weight, values = values[:,0], values[:,1:]
-        
-        image_weight = weight * occupancy
-        image_weight_norm = image_weight / (1e-9 + torch.sum(image_weight))
-        
-        g.fit(image_weight_norm.unsqueeze(1), values, n_iter=10)
-
-        cell_weight = torch.max(occupancy)
-        
-        #x: torch.Tensor(n, 1, d)
-        #mu: torch.Tensor(1, k, d)
-        #var: torch.Tensor(1, k, d) or (1, k, d, d)
-        #pi: torch.Tensor(1, k, 1)
-
-        zero = torch.tensor(0.,device=device)
-        one = torch.tensor(1.,device=device)
-        mask = cell_weight > 0
-        return cell_weight, torch.where(mask,  g.pi.squeeze(0).squeeze(1), one/n_components), torch.where(mask, g.mu.squeeze(0), zero), torch.where(mask, g.var.squeeze(0), one)
-
-    def initial_params(mask, values, occupancy):
-        indices = torch.multinomial(occupancy+1e-9, n_components, replacement= n_components >= len(occupancy))
-        mu_init = values[indices][:, 1:]
-
-        weight, values = values[:,0], values[:,1:]
-        image_weight = weight * occupancy
-        image_weight_norm = image_weight / (1e-9 + torch.sum(image_weight))
-
-        var_init = torch.sum(image_weight_norm[None,:,None] * (values[None,:] - mu_init[:,None])**2, dim=1)
-        var_init = var_init + 1e-1
-
-        return mu_init, var_init
-
-    def update_params(mask, values, occupancy, weight_prev, mu_prev, var_prev):
-        init = weight_prev < 1e-3 # todo: more sophisticated reinitialization decision
-        mu_init, var_init = initial_params(mask, values, occupancy)
-        return mu_init, var_init
-
-        init_mask = init[None, None]
-        return torch.where(init_mask, mu_init, mu_prev), torch.where(init_mask, var_init, var_prev)
-
-    images = images.permute(1,2,3,0)
+    images = images.permute(1,2,3,0) # Soft-kmeans expects feature last, whereas torch.grid_sample expects it first
     images = images.reshape(n_height*n_width,n_len,c)
     occupancy = occupancy.reshape((n_height*n_width,n_len))
     masks = masks.reshape((n_height*n_width,n_len))
 
-    if mu_init is None or var_init is None:
-        mu_init, var_init = torch.vmap(initial_params, randomness='different')(masks, images, occupancy)
+    importance, values = images[:, :, 0], images[:, :, 1:]
+
+    n_clusters = int(map_conf.cluster_ratio * map_conf.num_components)
+    if n_clusters > 1:
+        soft_k_means = SoftKMeans(normalize=None, n_clusters= n_clusters) # features are already unit-normed
+        mu = soft_k_means(values).centers # (n,k,d)
     else:
-        weight_init = weight_init.reshape((n_height*n_width,))
-        mu_init = mu_init.permute(2,3,0,1).reshape((n_height*n_width,n_components,n_features))
-        var_init = var_init.permute(2,3,0,1).reshape((n_height*n_width,n_components,n_features))
+        mu = values.mean(dim=1, keepdim=True)
+    
+    importance_norm = importance / (1e-9 + importance.sum(dim=1, keepdim=True))
+    var = (importance_norm[:,None,:,None] * (values[:,None,:] - mu[:,:,None])**2).sum(dim=2) # todo: use importance, or just 1/n
 
-        mu_init, var_init = torch.vmap(update_params, randomness='different')(masks, images, occupancy, weight_init, mu_init, var_init)
+    cluster_weight = torch.maximum(torch.cosine_similarity(values[:,None,:], mu[:,:,None], dim=3), torch.tensor(0.,device=device))
+    cluster_weight = cluster_weight / (1e-7 + torch.sum(cluster_weight,dim=2,keepdim=True))
+    occupancy_cluster = torch.sum(cluster_weight * occupancy[:,None,:], dim=2)
 
-    cell_weight, alpha, mu, var = torch.vmap(gaussian_mixture, randomness='error')(masks, images, occupancy, mu_init, var_init)
+    alpha =  map.cluster_weighter(mu, var, occupancy_cluster[:,:,None])
+    indices = torch.topk(alpha, k=map_conf.num_components, dim=1)[1]
 
-    return cell_weight.reshape(n_height,n_width), \
-           alpha.permute(1,0).reshape((n_components,n_height,n_width)), \
-           mu.permute(1,2,0).reshape((n_components,n_features,n_height,n_width)), \
-           var.permute(1,2,0).reshape((n_components,n_features,n_height,n_width))
+    cell_weight = torch.max(alpha, dim=1)[0]
+
+    indices_repeat = indices[:,:,None].repeat(1,1,n_features)
+
+    return cell_weight.reshape(n_height,n_width),\
+        torch.gather(alpha,1,indices).permute(1,0).reshape((n_components,n_height,n_width)),\
+        torch.gather(mu,1,indices_repeat).permute(1,2,0).reshape((n_components,n_features,n_height,n_width)),\
+        torch.gather(var,1,indices_repeat).permute(1,2,0).reshape((n_components,n_features,n_height,n_width))

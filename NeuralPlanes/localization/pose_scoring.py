@@ -10,7 +10,7 @@ def score_cells(map: NeuralMap, plane_indices: torch.Tensor, coords: torch.Tenso
     Computes the log-likelihood p_ij = Pr[ o_j, f_j | u_i, mu_i], where j = 0..n-1 is the feature index, i = 0..p-1 is the plane index
     :param map: NeuralMap
     :param plane_indices: (p,)
-    :param coords: (p, n, 2)
+    :param coords: (p, n, 3)
     :param values: (c, n)
     :param occupancy: n
     :param x0: (p,2)
@@ -30,7 +30,7 @@ def score_cells(map: NeuralMap, plane_indices: torch.Tensor, coords: torch.Tenso
     else:
         x1 = x1.to(device)
         
-    assert len(coords.shape) == 3 and coords.shape[0] == len(plane_indices), f"Expecting coords (p,n,2), got {coords.shape}, p={len(plane_indices)}"
+    assert len(coords.shape) == 3 and coords.shape[0] == len(plane_indices) and coords.shape[2]==3, f"Expecting coords (p,n,3), got {coords.shape}, p={len(plane_indices)}"
     n = coords.shape[1]
 
     assert len(values.shape) == 2 and (values.shape[1]==1 or n == values.shape[1]) and values.shape[0] == map.conf.num_features+1, f"Expecting values (c+1,n), got {values.shape},c={map.conf.num_features}, n={n}"
@@ -38,14 +38,19 @@ def score_cells(map: NeuralMap, plane_indices: torch.Tensor, coords: torch.Tenso
 
     planes = map.planes
 
-    mask = torch.all((x0[:,None,:] <= coords) & (coords <= x1[:,None,:]), dim=2)
-    coords = planes.coord_x0.to(device)[plane_indices][:,None].to(device) + planes.coord_size.to(device)[plane_indices][:,None] * coords
-    coords = 2*(coords/ torch.tensor(map.planes.atlas_size,device=coords.device)[None,:]) - 1
+    mask = torch.all((x0[:,None,:] <= coords[:,:,0:2]) & (coords[:,:,0:2] <= x1[:,None,:]), dim=2)
 
-    mu_cells = torch.nn.functional.grid_sample(map.atlas_mu.reshape((1,n_components*n_features, atlas_height, atlas_width)), coords[None])[0]
-    var_cells = torch.nn.functional.grid_sample(map.atlas_var.reshape((1,n_components*n_features, atlas_height, atlas_width)), coords[None])[0]
-    alpha_cells = torch.nn.functional.grid_sample(map.atlas_alpha.reshape((1,n_components, atlas_height, atlas_width)), coords[None])[0]
-    weight_cells = torch.nn.functional.grid_sample(map.atlas_weight.reshape((1,1, atlas_height, atlas_width)), coords[None])[0,0]
+    coords2 = coords[:,:,0:2]
+    z = coords[:,:,2]
+    coords2 = planes.coord_x0.to(device)[plane_indices][:,None].to(device) + planes.coord_size.to(device)[plane_indices][:,None] * coords2
+    coords2 = 2*(coords2/ torch.tensor(map.planes.atlas_size,device=coords2.device)[None,:]) - 1
+
+    #values = map.positional(values[:,None].reshape(n_features, ), z, model_first=False)
+
+    mu_cells = torch.nn.functional.grid_sample(map.atlas_mu.reshape((1,n_components*n_features, atlas_height, atlas_width)), coords2[None])[0]
+    var_cells = torch.nn.functional.grid_sample(map.atlas_var.reshape((1,n_components*n_features, atlas_height, atlas_width)), coords2[None])[0]
+    alpha_cells = torch.nn.functional.grid_sample(map.atlas_alpha.reshape((1,n_components, atlas_height, atlas_width)), coords2[None])[0]
+    weight_cells = torch.nn.functional.grid_sample(map.atlas_weight.reshape((1,1, atlas_height, atlas_width)), coords2[None])[0,0]
     weight_cells = torch.where(mask, weight_cells, torch.tensor(0.))
 
     mu_cells = torch.where(mask, mu_cells, torch.tensor(0., device=device))
@@ -53,26 +58,23 @@ def score_cells(map: NeuralMap, plane_indices: torch.Tensor, coords: torch.Tenso
     alpha_cells = torch.where(mask, alpha_cells, torch.tensor(1. / n_components, device=device))
     weight_cells = torch.where(mask, weight_cells, torch.tensor(0., device=device))
 
-    #print("mask ", mask.type(torch.float).mean(), weight_cells.mean())
+    def score_plane(z, weight, alpha, mu, var, value, occupancy):
+        n = value.shape[1]
+        mu = mu.reshape((n_components,n_features,n))
+        var = var.reshape((n_components,n_features,n))
+        alpha = alpha.reshape((n_components,n))
+        weight_cells = weight.reshape((n,))
 
-    def score_cell(map_weight, alpha, mu, var, value, occupancy):
         feature_weight, value = value[0], value[1:] 
-        mixture = gmm.GaussianMixture(n_components=n_components, n_features=n_features, pi_init=alpha.reshape((1,n_components,1)), mu_init=mu.reshape((1,n_components, n_features)), var_init=var.reshape((1,n_components,n_features)), covariance_type='diag')
-        log_prob = mixture.score_samples(occupancy[None], value[None], normalize=False)[0]
-        return torch.where(map_weight > 0, log_prob, torch.tensor(0, device=device)), feature_weight * map_weight
 
-    def score_plane(weight, alpha, mu, var, value, occupancy):
-        return torch.vmap(score_cell, in_dims=(0,1,1,1,1,0))(weight, alpha, mu, var, value, occupancy)
+        value = map.positional(value, z, model_first=True)
+        scores = torch.maximum(torch.cosine_similarity(mu[:,:], value[None,:,:], dim=1), torch.tensor(0.,device=device)) # (mu=(n_c,n_f,n), value=(c,n))
+        score, top_index = scores.max(dim=0)
 
-    #print("FINITE CHECK")
-    #print(torch.isfinite(weight_cells).all())
-    #print(torch.isfinite(alpha_cells).all())
-    #print(torch.isfinite(mu_cells).all())
-    #print(torch.isfinite(var_cells).all())
-    #print(values.isfinite().all())
-    #print(occupancy.isfinite().all())
+        score = alpha.gather(0, top_index[None,:])[:,0] * score
+        return score, weight
 
-    return torch.vmap(score_plane, in_dims=(0,1,1,1,None,None))(weight_cells, alpha_cells, mu_cells, var_cells, values, occupancy)
+    return torch.vmap(score_plane, in_dims=(0,0,1,1,1,None,None))(z, weight_cells, alpha_cells, mu_cells, var_cells, values, occupancy)
 
 #@torch.compile
 def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.Tensor, samples: int = 5, plane_indices: torch.Tensor = None, rel_x0=None, rel_x1=None, dense=False):
@@ -84,9 +86,12 @@ def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.T
     if plane_indices is None:
         plane_indices = torch.arange(len(planes))
 
-    x0s = torch.zeros((len(plane_indices), 2))
-    x1s = torch.ones((len(plane_indices), 2))
-    visibility_mask = single_frustum_multiple_plane_visibility(map.planes, plane_indices, frustum_points(cam), x0s, x1s)
+    if rel_x0 is None:
+        rel_x0 = torch.zeros((len(plane_indices), 2))
+    if rel_x1 is None:
+        rel_x1 = torch.ones((len(plane_indices), 2))
+    plane_indices = plane_indices.to(device)
+    visibility_mask = single_frustum_multiple_plane_visibility(map.planes, plane_indices, frustum_points(cam), rel_x0, rel_x1)
 
     plane_indices = plane_indices.clone().to(device)[visibility_mask]
 
@@ -99,6 +104,7 @@ def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.T
     pos = orig[:,:,None] + dir[:,:,None] * t_samples[:,:,:,None]
 
     x0s = planes.x0s.to(device)[plane_indices]
+    normal = planes.planes.to(device)[plane_indices, 0:3]
     us = planes.us.to(device)[plane_indices]
     vs = planes.vs.to(device)[plane_indices]
     us = us / torch.linalg.norm(us,dim=1)[:,None]**2
@@ -106,7 +112,8 @@ def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.T
 
     pos = pos.reshape((height*width*samples,3))
 
-    coords = torch.stack([torch.einsum("ik,ijk->ij", us, pos[None] - x0s[:,None,:]), torch.einsum("ik,ijk->ij",vs,pos[None]-x0s[:,None,:])], dim=2)
+    offset = pos[None]-x0s[:,None,:]
+    coords = torch.stack([torch.einsum("ik,ijk->ij", us, pos[None] - x0s[:,None,:]), torch.einsum("ik,ijk->ij",vs,offset), torch.einsum("ik,ijk->ij", normal, offset)], dim=2)
 
     # don't weight by occupancy since samples are already normally distributed,
     # hence when computing cross-entropy p(x) is captured implicitly by the discrete set distribution
@@ -122,19 +129,17 @@ def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.T
             return torch.tensor(0., device=device), torch.tensor(0., device=device)
 
     #print("Scoring cells planes= ", len(plane_indices))
-    log_prob, weight = score_cells(map, plane_indices, coords, feature_samples, occupancy_samples, x0=rel_x0, x1=rel_x1)
-    log_prob = log_prob.reshape((len(plane_indices),height,width,samples))
+    scores, weight = score_cells(map, plane_indices, coords, feature_samples, occupancy_samples, x0=rel_x0, x1=rel_x1)
+    scores = scores.reshape((len(plane_indices),height,width,samples))
     weight = weight.reshape((len(plane_indices),height,width,samples))
 
     #print("log prob mean ", log_prob.mean(), "weight mean", weight.mean())
 
-    log_prob = torch.where(weight>0, log_prob, torch.tensor(0., device=device))
-    prob = (torch.exp(log_prob) * weight).sum(dim=0) / (1e-9 + weight.sum(dim=0))
-    weight = weight.sum(dim=0)
-
-    #prob = torch.exp(log_prob)
+    scores = torch.where(weight>0, scores, torch.tensor(0., device=device))
+    score = (scores * weight).sum(dim=0) / (1e-9 + weight.sum(dim=0))
+    weight = torch.ones_like(score) # weight: already included in the alphas, for compatibility reason set it to one
 
     if dense:
-        return prob, weight, pos.reshape((height,width,samples,3)), feature_samples.reshape((c,height,width,samples))
+        return (weight*score), weight, pos.reshape((height,width,samples,3)), feature_samples.reshape((c,height,width,samples))
     else:
-        return torch.sum(prob * weight) / (1e-9 + torch.sum(weight)), weight.mean()
+        return torch.sum(weight*score) / (1e-9 + torch.sum(weight)), weight.mean()

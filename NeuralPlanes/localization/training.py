@@ -24,7 +24,7 @@ class NeuralMapBuilderConf(NeuralMapConf):
     depth_sigma: float = 0.5
     num_epochs: int = 10
     max_views_per_chunk: int = 15
-    column_sampling_density: float = 2.0
+    column_sampling_density: float = 10
     depth_distribution_samples: int = 10
 
 
@@ -52,8 +52,6 @@ class NeuralMapBuilder:
             self.planes = planes
             width, height = planes.atlas_size
 
-            encoder = encoder.to(self.device)
-
             self.map = NeuralMap(
                 encoder = encoder,
                 planes=planes,
@@ -64,8 +62,11 @@ class NeuralMapBuilder:
                 conf=conf
             )
 
+        self.planes = planes.to('cpu')
         self._assign_cameras_to_planes()
         self._select_chunk_order()
+        self.map = self.map.to(self.device)
+        self.cameras = [cam.to(self.device) for cam in self.cameras]
 
     def _select_chunk_order(self):
         result = []
@@ -83,12 +84,13 @@ class NeuralMapBuilder:
 
         planes = self.planes
         width, height = planes.coord_size[plane_id]
+        width, height = int(width), int(height)
 
-        v0, u0 = torch.meshgrid(chunk_size * torch.arange(0, int(ceil(height / chunk_size))),
-                                chunk_size * torch.arange(0, int(ceil(width / chunk_size))))
+        v0, u0 = torch.meshgrid(chunk_size * torch.arange(0, int(ceil(float(height) / chunk_size))),
+                                chunk_size * torch.arange(0, int(ceil(float(width) / chunk_size))))
 
-        u1 = torch.minimum(u0 + chunk_size, width)
-        v1 = torch.minimum(v0 + chunk_size, height)
+        u1 = torch.minimum(u0 + chunk_size, torch.tensor(width))
+        v1 = torch.minimum(v0 + chunk_size, torch.tensor(height))
 
         return torch.stack([u0, v0], dim=2), torch.stack([u1 - u0, v1 - v0], dim=2)
     
@@ -101,6 +103,8 @@ class NeuralMapBuilder:
         return rel_x0, rel_x1
 
     def _assign_cameras_to_planes(self):
+        print("Assigning cameras to planes : ", len(self.planes))
+        
         planes = self.planes
         cameras = self.cameras
 
@@ -111,7 +115,10 @@ class NeuralMapBuilder:
         self.visible_camera_idx = []
         self.inside_camera_idx = []
 
-        for plane_id in range(len(planes)):
+        planes = self.planes.to('cpu')
+        cameras = [cam.to('cpu') for cam in self.cameras]
+
+        for plane_id in tqdm.tqdm(range(len(planes))):
             chunk_coord, chunk_size = self._chunk_neural_map(plane_id)
 
             plane_size_unsqueezed = torch.tensor(planes.coord_size[plane_id])[None, None]
@@ -119,7 +126,7 @@ class NeuralMapBuilder:
             rel_x1 = (chunk_coord + chunk_size).type(torch.float) / plane_size_unsqueezed
 
             visibility = frustum_plane_visibility(planes, plane_id, fps, (0., 0.), (1., 1.))
-            indices = torch.arange(len(fps))[visibility]
+            indices = torch.arange(len(fps), device=self.device)[visibility]
             fps_visible = fps[visibility]
 
             indices_chunk_grid = []
@@ -157,8 +164,8 @@ class NeuralMapBuilder:
                 indices_chunk_grid.append(indices_per_row)
                 indices_inside_chunk_grid.append(indices_inside_per_row)
 
-            self.chunk_coord.append(chunk_coord)
-            self.chunk_size.append(chunk_size)
+            self.chunk_coord.append(chunk_coord.to(self.device))
+            self.chunk_size.append(chunk_size.to(self.device))
             self.visible_camera_idx.append(indices_chunk_grid)
             self.inside_camera_idx.append(indices_inside_chunk_grid)
 
@@ -218,7 +225,8 @@ class NeuralMapBuilder:
             start = origin.reshape((-1, 3)) + tmin[:, None] * dir.reshape((-1, 3))
             end = origin.reshape((-1, 3)) + tmax[:, None] * dir.reshape((-1, 3))
 
-            length = self.conf.column_sampling_density * torch.max(torch.cat([torch.linalg.norm(end - start, dim=1)[mask], torch.zeros(1,device=device)]))
+
+            length = self.conf.column_sampling_density #* torch.max(torch.cat([torch.linalg.norm(end - start, dim=1)[mask], torch.zeros(1,device=device)]))
             length = int(ceil(length))
 
             if length == 0:
@@ -232,6 +240,7 @@ class NeuralMapBuilder:
                 return sample_coords, proj[:,:,2], pos
 
             def sample_linear_pdf(u, x0, x1, d):
+                x0,x1 = torch.minimum(x0,x1), torch.maximum(x0,x1)
                 return d * (-x0 + torch.sqrt(x0 ** 2 + (x1 ** 2 - x0 ** 2) * u)) / (x1 - x0 + 1e-9)
 
             def depth_to_occupancy(depth, depth_values):
@@ -246,22 +255,35 @@ class NeuralMapBuilder:
             occupancy = depth_to_occupancy(depth, depth_values)
 
             # sample based on linear pdf
-            tsample_index = torch.multinomial(occupancy+1e-9, num_samples=length, replacement= length > self.conf.depth_distribution_samples)
-            tsample = torch.rand_like(tsample_index,dtype=torch.float)
+            enable_importance_sampling = True
+            if enable_importance_sampling:
+                tsample_index = torch.multinomial(occupancy+1e-9, num_samples=length, replacement= length > self.conf.depth_distribution_samples)
+                tsample = torch.rand_like(tsample_index,dtype=torch.float)
 
-            x0 = torch.gather(depth_values, 1, tsample_index)
-            limit = torch.tensor(self.conf.depth_distribution_samples-1, device=device).unsqueeze(0)
-            x1 = torch.gather(depth_values, 1, torch.minimum(tsample_index+1, limit))
+                x0 = torch.gather(occupancy, 1, tsample_index)
+                limit = torch.tensor(self.conf.depth_distribution_samples-1, device=device).unsqueeze(0)
+                x1 = torch.gather(occupancy, 1, torch.minimum(tsample_index+1, limit))
 
-            delta = 1.0/(depth_distribution_samples-1)
-            tsample = tsample_index*delta + sample_linear_pdf(tsample, x0, x1, delta)
-            #tsample = tsample.reshape((height,width,length))
+                delta = 1.0/(depth_distribution_samples-1)
+                offset = sample_linear_pdf(tsample, x0, x1, delta)
+                tsample = tsample_index*delta + offset 
+                #tsample = tsample.reshape((height,width,length))
+            else:
+                tsample = torch.linspace(0, 1, length, device=device)[None].repeat(height*width, 1)
 
             sample_coords, depth, pos = get_sample_coords(tsample)
             image_values = torch.nn.functional.grid_sample(input_image[None], sample_coords[None])[0]
             depth_values = torch.nn.functional.grid_sample(input_depth[None,None], sample_coords[None])[0,0]
-            
+
+            z = torch.einsum("k,ijk->ij", planes.planes[plane_id,0:3].to(device), pos - planes.x0s.to(device)[plane_id][None,None,:])
+            z = torch.where(mask[:,None], z, torch.tensor(0,device=device))
+
             occupancy = depth_to_occupancy(depth, depth_values)
+
+            positional = self.map.positional(image_values[1:].reshape((c-1, height*width*length)), z.flatten(), model_first=True).reshape(c-1, height*width, length)
+
+            print(image_values[0:1].shape, positional.shape)
+            image_values = torch.cat([image_values[0:1], positional], dim=0)            
 
             #depth = depth.reshape((height,width,length))
             occupancy = occupancy.reshape((height,width,length))
@@ -311,7 +333,7 @@ class NeuralMapBuilder:
         y0,y1 = int(y0),int(y1)
 
         print("Pooling images")
-        weight, alpha, mu, var = pool_images(map.conf, masks, values, occupancy, tsamples,
+        weight, alpha, mu, var = pool_images(map, masks, values, occupancy, tsamples,
                                              weight_init=map.atlas_weight[y0:y1, x0:x1],
                                              mu_init=map.atlas_mu[:, :, y0:y1, x0:x1],
                                              var_init=map.atlas_var[:, :, y0:y1, x0:x1]
@@ -452,8 +474,8 @@ class NeuralMapBuilder:
                 
                 for i, cam_id in enumerate(inside_camera_idx): 
                     cam, image, depth = cameras[cam_id], features[cam_id], depths[cam_id]
-                    
-                    l, score, neg_score = mine_negatives(self.map, plane, rel_x0, rel_x1, cam, image, depth, self.conf.ransac)
+                    negative_cam = [cameras[j] for j in range(len(inside_camera_idx)) if i != j]
+                    l, score, neg_score = mine_negatives(self.map, plane, rel_x0, rel_x1, cam, negative_cam, image, depth, self.conf.ransac)
                     losses[i] = l
                     scores[i] = score
                     neg_scores[i] = neg_score
