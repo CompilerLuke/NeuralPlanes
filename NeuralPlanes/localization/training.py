@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from NeuralPlanes.utils import select_device
 from NeuralPlanes.localization.image_pooling import pool_images
 from NeuralPlanes.localization.negative_pose_mining import mine_negatives, RansacMiningConf
-from NeuralPlanes.localization.map import NeuralMap, NeuralMapConf
+from NeuralPlanes.localization.map import NeuralMap, NeuralMapConf, normalize_features
 from torch.utils.tensorboard import SummaryWriter
 import datetime
 
@@ -35,32 +35,49 @@ class NeuralMapBuilder:
     conf: NeuralMapBuilderConf
     map: NeuralMap
 
-
     chunk_coord: List[torch.Tensor]  # (h,w,2)
     chunk_size: List[torch.Tensor]  # (h,w,2)
     visible_camera_idx: List[List[List[torch.Tensor]]]
     inside_camera_idx: List[List[List[torch.Tensor]]] # indices refer to elements of visible_camera_idx, so absolute id = visible_camera_idx[i][j][k][inside_camera_idx[i][j][k]]
 
-    def __init__(self, planes, cameras: List[Camera], conf: NeuralMapBuilderConf):
-        self.planes = planes
-
+    def __init__(self, cameras: List[Camera], planes=None, map: NeuralMap = None, encoder=None, conf: NeuralMapBuilderConf = NeuralMapBuilderConf()):
         self.cameras = cameras
         self.conf = conf
         self.device = select_device()
+    
+        if map:
+            self.planes = map.planes
+            self.map = map
+        else:
+            self.planes = planes
+            width, height = planes.atlas_size
 
-        width, height = planes.atlas_size
+            encoder = encoder.to(self.device)
 
-        self.map = NeuralMap(
-            planes=planes,
-            atlas_alpha=torch.zeros((conf.num_components, height, width), device=self.device),
-            atlas_mu=torch.zeros((conf.num_components, conf.num_features, height, width), device=self.device),
-            atlas_var=torch.zeros((conf.num_components, conf.num_features, height, width), device=self.device),
-            atlas_weight=torch.zeros((height, width), device=self.device),
-            conf=conf
-        )
-
+            self.map = NeuralMap(
+                encoder = encoder,
+                planes=planes,
+                atlas_alpha=torch.zeros((conf.num_components, height, width), device=self.device),
+                atlas_mu=torch.zeros((conf.num_components, conf.num_features, height, width), device=self.device),
+                atlas_var=torch.zeros((conf.num_components, conf.num_features, height, width), device=self.device),
+                atlas_weight=torch.zeros((height, width), device=self.device),
+                conf=conf
+            )
 
         self._assign_cameras_to_planes()
+        self._select_chunk_order()
+
+    def _select_chunk_order(self):
+        result = []
+        for i in range(len(self.visible_camera_idx)):
+            height, width, _ = self.chunk_size[i].shape
+            for j in range(height):
+                for k in range(width):
+                    result.append((i, j, k))
+            
+        result = torch.tensor(result)[torch.randperm(len(result))[:len(result)]]
+        self.chunk_order = result
+
     def _chunk_neural_map(self, plane_id: int):
         chunk_size = self.conf.chunk_size
 
@@ -74,6 +91,14 @@ class NeuralMapBuilder:
         v1 = torch.minimum(v0 + chunk_size, height)
 
         return torch.stack([u0, v0], dim=2), torch.stack([u1 - u0, v1 - v0], dim=2)
+    
+    def _chunk_relative_extent(self,plane_id,i,j):
+        chunk_coord = self.chunk_coord[plane_id][i][j]
+        chunk_size = self.chunk_size[plane_id][i][j]
+        size = self.planes.coord_size[plane_id]
+        rel_x0 = chunk_coord.type(torch.float) / size
+        rel_x1 = (chunk_coord + chunk_size).type(torch.float) / size
+        return rel_x0, rel_x1
 
     def _assign_cameras_to_planes(self):
         planes = self.planes
@@ -148,6 +173,8 @@ class NeuralMapBuilder:
 
         plane_id, i, j = chunk_id
 
+        conf = self.conf
+
         chunk_coord = self.chunk_coord[plane_id][i][j]
         chunk_size = self.chunk_size[plane_id][i][j]
 
@@ -155,8 +182,7 @@ class NeuralMapBuilder:
         width = int(width)
         height = int(height)
 
-        rel_x0 = chunk_coord.type(torch.float) / planes.coord_size[plane_id]
-        rel_x1 = (chunk_coord + chunk_size).type(torch.float) / planes.coord_size[plane_id]
+        rel_x0, rel_x1 = self._chunk_relative_extent(plane_id, i, j)
 
         v, u = torch.meshgrid(torch.linspace(rel_x0[1], rel_x1[1], height, device=self.device),
                               torch.linspace(rel_x0[0], rel_x1[0], width, device=self.device))
@@ -234,11 +260,12 @@ class NeuralMapBuilder:
             sample_coords, depth, pos = get_sample_coords(tsample)
             image_values = torch.nn.functional.grid_sample(input_image[None], sample_coords[None])[0]
             depth_values = torch.nn.functional.grid_sample(input_depth[None,None], sample_coords[None])[0,0]
+            
             occupancy = depth_to_occupancy(depth, depth_values)
 
             #depth = depth.reshape((height,width,length))
             occupancy = occupancy.reshape((height,width,length))
-            image_values = image_values.reshape((input_image.shape[0], height, width, length))
+            image_values = image_values.reshape((c, height, width, length))
             depth_values = depth_values.reshape((height, width, length))
             tsample = tsample.reshape((height, width, length))
             pos = pos.reshape((height, width, length, 3))
@@ -261,20 +288,14 @@ class NeuralMapBuilder:
                torch.cat(out_pos, dim=2)
 
     def chunks(self):
-        result = []
-        for i in range(len(self.visible_camera_idx)):
-            height, width, _ = self.chunk_size[i].shape
-            for j in range(height):
-                for k in range(width):
-                    result.append((i, j, k))
-        return result
+        return self.chunk_order
 
     #@torch.compile
     def update_chunk(self, chunk_id, features, depths, cameras):
         plane_idx, i, j = chunk_id
 
         b,c,height,width = features.shape
-        assert c == self.conf.num_features
+        assert c == self.conf.num_features+1
 
         print("Sampling images")
         masks, values, occupancy, tsamples, pos = self.sample_images(chunk_id, features, depths, cameras)
@@ -285,6 +306,9 @@ class NeuralMapBuilder:
         x0, y0 = self.planes.coord_x0[plane_idx] + self.chunk_coord[plane_idx][i, j]
         sx, sy = self.chunk_size[plane_idx][i, j]
         x1, y1 = x0 + sx, y0 + sy
+
+        x0,x1 = int(x0),int(x1)
+        y0,y1 = int(y0),int(y1)
 
         print("Pooling images")
         weight, alpha, mu, var = pool_images(map.conf, masks, values, occupancy, tsamples,
@@ -351,11 +375,42 @@ class NeuralMapBuilder:
 
         plt.show()
 
-    def train(self, image_db, depth_db):
+    def extract_features(self, ids, image_db, depth_db):
+        device = self.device
+        cameras =  [self.cameras[id].to(device) for id in ids]
+        device = self.device
+        features_orig = torch.stack([ image_db[id]["image"] for id in ids]).to(device)
+        depths = torch.stack([depth_db[id]["image"] for id in ids]).to(device)
+
+        print("Encoding chunk")
+        b, c, height, width = features_orig.shape
+        features = self.map.encoder({"image": features_orig})["image"]
+        features = normalize_features(self.conf, features)
+
+        return cameras, features, depths
+
+    def gen(self, image_db, depth_db):
+        with torch.no_grad():
+            conf = self.conf
+
+            save_checkpoint = "checkpoint/model.pt"
+            device = select_device()
+
+            for plane, i, j in tqdm.tqdm(self.chunks()):
+                ids = self.visible_camera_idx[plane][i][j]
+                if len(ids) == 0:
+                    continue
+
+                cameras, features, depths = self.extract_features(ids, image_db, depth_db)
+                print(f"Updating chunk {plane} {i} {j} - {len(cameras)}")
+                self.update_chunk((plane, i, j), features=features, depths=depths, cameras=cameras)
+                print("Updated chunk")
+
+            torch.save(self.map.state_dict(), save_checkpoint)
+
+    def train(self, image_db, depth_db, log_dir, save_checkpoint):
         conf = self.conf
 
-        log_dir = "logs/fit/run"
-        save_checkpoint = "checkpoint/model.pt"
         writer = SummaryWriter(log_dir)
 
         device = select_device()
@@ -374,39 +429,37 @@ class NeuralMapBuilder:
                     #self.plot_map()
                 iter += 1
 
-                cameras = [self.cameras[id].to(device) for id in ids]
 
+                cameras, features, depths = self.extract_features(ids, image_db, depth_db)
                 print(f"Updating chunk {plane} {i} {j} - {len(cameras)}")
-
-                features_orig = torch.stack([ image_db[id]["image"] for id in ids]).to(device)
-                depths = torch.stack([depth_db[id]["image"] for id in ids]).to(device)
-
-                b, c, height, width = features_orig.shape
-
-                print(f"Encoding chunk {plane} {i} {j} - {len(cameras)}")
-
-                features = self.map.encoder(features_orig.permute(0, 2, 3, 1).reshape(b * height * width, c))
-                features = features.reshape(b, height, width, conf.num_features).permute(0, 3, 1, 2)
-
-                print("Generated feature")
 
                 if not self.update_chunk((plane, i, j), features=features, depths=depths, cameras=cameras):
                     continue
                 print("Updated chunk")
-                if first:
-                    continue
+                #if first:
+                #    continue
 
                 inside_camera_idx = self.inside_camera_idx[plane][i][j]
                 if len(inside_camera_idx) == 0:
                     continue
                 optim.zero_grad()
 
-                loss = torch.zeros(len(inside_camera_idx), device=self.device)
+                rel_x0, rel_x1 = self._chunk_relative_extent(plane,i,j)
+
+                losses = torch.zeros(len(inside_camera_idx), device=self.device)
+                scores = torch.zeros(len(inside_camera_idx), device=self.device)
+                neg_scores = torch.zeros(len(inside_camera_idx), device=self.device)
+                
                 for i, cam_id in enumerate(inside_camera_idx): 
                     cam, image, depth = cameras[cam_id], features[cam_id], depths[cam_id]
-                    loss[i] = mine_negatives(self.map, cam, image, depth, self.conf.ransac)
+                    
+                    l, score, neg_score = mine_negatives(self.map, plane, rel_x0, rel_x1, cam, image, depth, self.conf.ransac)
+                    losses[i] = l
+                    scores[i] = score
+                    neg_scores[i] = neg_score
+
                     print("Mined negative")
-                loss = loss.mean()
+                loss = losses.mean()
                 loss.backward()
 
                 if not torch.isfinite(loss):
@@ -418,12 +471,19 @@ class NeuralMapBuilder:
 
                 writer.add_scalar('training loss', loss.item(), iter)
 
+                if neg_scores.sum() > 0:
+                    writer.add_scalars('contrastive', { 'score': scores.mean().item(), 'neg_score':  neg_scores[neg_scores>0].mean().item()}, iter)
+
                 print("Loss loss = ", loss)
                 gc.collect()
                 # further zeroeing required?, self.map.parameters()
 
             first = False
-            torch.save(self.map.state_dict(), save_checkpoint)
 
+        if save_checkpoint:
+            torch.save(self.map.state_dict(), save_checkpoint)
+        self.gen(image_db, depth_db)
+        if save_checkpoint:
+            torch.save(self.map.state_dict(), save_checkpoint)
         writer.close()
 

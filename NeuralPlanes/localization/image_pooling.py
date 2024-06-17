@@ -5,17 +5,24 @@ import torch
 
 def pool_images(map_conf: NeuralMapConf, masks, images, occupancy, t, weight_init=None, mu_init=None, var_init=None):
     n_components = map_conf.num_components
-    n_features,n_height,n_width,n_len = images.shape
+    n_features = map_conf.num_features
+    c,n_height,n_width,n_len = images.shape
     device = images.device
+
+    assert c == n_features+1
 
     def gaussian_mixture(mask, values, occupancy, mu_init, var_init):
         g = gmm.GaussianMixture(n_components=n_components, n_features=n_features, mu_init=mu_init[None], var_init=var_init[None], covariance_type="diag")
 
-        image_weight = occupancy / (1e-9 + torch.sum(occupancy))
-        g.fit(image_weight.unsqueeze(1), values, n_iter=10)
+        weight, values = values[:,0], values[:,1:]
+        
+        image_weight = weight * occupancy
+        image_weight_norm = image_weight / (1e-9 + torch.sum(image_weight))
+        
+        g.fit(image_weight_norm.unsqueeze(1), values, n_iter=10)
 
         cell_weight = torch.max(occupancy)
-
+        
         #x: torch.Tensor(n, 1, d)
         #mu: torch.Tensor(1, k, d)
         #var: torch.Tensor(1, k, d) or (1, k, d, d)
@@ -28,10 +35,13 @@ def pool_images(map_conf: NeuralMapConf, masks, images, occupancy, t, weight_ini
 
     def initial_params(mask, values, occupancy):
         indices = torch.multinomial(occupancy+1e-9, n_components, replacement= n_components >= len(occupancy))
-        mu_init = values[indices]
+        mu_init = values[indices][:, 1:]
 
-        occupancy_weight = occupancy / (1e-9 + occupancy.sum())
-        var_init = torch.sum(occupancy_weight[None,:,None] * (values[None,:] - mu_init[:,None])**2, dim=1)
+        weight, values = values[:,0], values[:,1:]
+        image_weight = weight * occupancy
+        image_weight_norm = image_weight / (1e-9 + torch.sum(image_weight))
+
+        var_init = torch.sum(image_weight_norm[None,:,None] * (values[None,:] - mu_init[:,None])**2, dim=1)
         var_init = var_init + 1e-1
 
         return mu_init, var_init
@@ -39,12 +49,13 @@ def pool_images(map_conf: NeuralMapConf, masks, images, occupancy, t, weight_ini
     def update_params(mask, values, occupancy, weight_prev, mu_prev, var_prev):
         init = weight_prev < 1e-3 # todo: more sophisticated reinitialization decision
         mu_init, var_init = initial_params(mask, values, occupancy)
+        return mu_init, var_init
 
         init_mask = init[None, None]
         return torch.where(init_mask, mu_init, mu_prev), torch.where(init_mask, var_init, var_prev)
 
     images = images.permute(1,2,3,0)
-    images = images.reshape(n_height*n_width,n_len,n_features)
+    images = images.reshape(n_height*n_width,n_len,c)
     occupancy = occupancy.reshape((n_height*n_width,n_len))
     masks = masks.reshape((n_height*n_width,n_len))
 

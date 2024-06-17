@@ -5,29 +5,40 @@ from NeuralPlanes import gmm
 import torch
 
 #@torch.compile
-def score_cells(map: NeuralMap, plane_indices: torch.Tensor, coords: torch.Tensor, values: torch.Tensor, occupancy: torch.Tensor):
+def score_cells(map: NeuralMap, plane_indices: torch.Tensor, coords: torch.Tensor, values: torch.Tensor, occupancy: torch.Tensor, x0: torch.Tensor, x1: torch.Tensor):
     """
     Computes the log-likelihood p_ij = Pr[ o_j, f_j | u_i, mu_i], where j = 0..n-1 is the feature index, i = 0..p-1 is the plane index
     :param map: NeuralMap
-    :param plane_indices: (p, n)
+    :param plane_indices: (p,)
     :param coords: (p, n, 2)
     :param values: (c, n)
     :param occupancy: n
+    :param x0: (p,2)
+    :param x1: (p,2)
     :return: (p, n)
     """
-
+    n_planes = len(plane_indices)
     n_components, n_features, atlas_height, atlas_width = map.atlas_mu.shape
     device = coords.device
 
+    if x0 is None:
+        x0 = torch.zeros((n_planes,2), device=device)
+    else:
+        x0 = x0.to(device)
+    if x1 is None:
+        x1 = torch.ones((n_planes,2), device=device)
+    else:
+        x1 = x1.to(device)
+        
     assert len(coords.shape) == 3 and coords.shape[0] == len(plane_indices), f"Expecting coords (p,n,2), got {coords.shape}, p={len(plane_indices)}"
     n = coords.shape[1]
 
-    assert len(values.shape) == 2 and (values.shape[1]==1 or n == values.shape[1]) and values.shape[0] == map.conf.num_features, f"Expecting values (c,n), got {values.shape},c={map.conf.num_features}, n={n}"
+    assert len(values.shape) == 2 and (values.shape[1]==1 or n == values.shape[1]) and values.shape[0] == map.conf.num_features+1, f"Expecting values (c+1,n), got {values.shape},c={map.conf.num_features}, n={n}"
     assert len(occupancy.shape) == 1 and (occupancy.shape[0]==1 or n == occupancy.shape[0]), f"Expecting occupancy (n), got {occupancy.shape}"
 
     planes = map.planes
 
-    mask = torch.all((0 <= coords) & (coords <= 1), dim=2)
+    mask = torch.all((x0[:,None,:] <= coords) & (coords <= x1[:,None,:]), dim=2)
     coords = planes.coord_x0.to(device)[plane_indices][:,None].to(device) + planes.coord_size.to(device)[plane_indices][:,None] * coords
     coords = 2*(coords/ torch.tensor(map.planes.atlas_size,device=coords.device)[None,:]) - 1
 
@@ -44,10 +55,11 @@ def score_cells(map: NeuralMap, plane_indices: torch.Tensor, coords: torch.Tenso
 
     #print("mask ", mask.type(torch.float).mean(), weight_cells.mean())
 
-    def score_cell(weight, alpha, mu, var, value, occupancy):
+    def score_cell(map_weight, alpha, mu, var, value, occupancy):
+        feature_weight, value = value[0], value[1:] 
         mixture = gmm.GaussianMixture(n_components=n_components, n_features=n_features, pi_init=alpha.reshape((1,n_components,1)), mu_init=mu.reshape((1,n_components, n_features)), var_init=var.reshape((1,n_components,n_features)), covariance_type='diag')
         log_prob = mixture.score_samples(occupancy[None], value[None], normalize=False)[0]
-        return torch.where(weight > 0, log_prob, torch.tensor(0, device=device)), weight
+        return torch.where(map_weight > 0, log_prob, torch.tensor(0, device=device)), feature_weight * map_weight
 
     def score_plane(weight, alpha, mu, var, value, occupancy):
         return torch.vmap(score_cell, in_dims=(0,1,1,1,1,0))(weight, alpha, mu, var, value, occupancy)
@@ -63,17 +75,20 @@ def score_cells(map: NeuralMap, plane_indices: torch.Tensor, coords: torch.Tenso
     return torch.vmap(score_plane, in_dims=(0,1,1,1,None,None))(weight_cells, alpha_cells, mu_cells, var_cells, values, occupancy)
 
 #@torch.compile
-def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.Tensor, samples: int = 5, dense=False):
+def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.Tensor, samples: int = 5, plane_indices: torch.Tensor = None, rel_x0=None, rel_x1=None, dense=False):
     planes = map.planes
 
     device = image.device
     c,height,width = image.shape
 
-    x0s = torch.zeros((len(planes), 2))
-    x1s = torch.ones((len(planes), 2))
-    visibility_mask = single_frustum_multiple_plane_visibility(map.planes, torch.arange(len(planes)), frustum_points(cam), x0s, x1s)
+    if plane_indices is None:
+        plane_indices = torch.arange(len(planes))
 
-    plane_indices = torch.arange(len(planes),device=device)[visibility_mask]
+    x0s = torch.zeros((len(plane_indices), 2))
+    x1s = torch.ones((len(plane_indices), 2))
+    visibility_mask = single_frustum_multiple_plane_visibility(map.planes, plane_indices, frustum_points(cam), x0s, x1s)
+
+    plane_indices = plane_indices.clone().to(device)[visibility_mask]
 
     depth_sigma = map.conf.depth_sigma
 
@@ -104,10 +119,10 @@ def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.T
         if dense:
             return torch.zeros((height,width,samples), device=image.device), torch.zeros((height,width,samples), device=image.device),  feature_samples.reshape((c,height,width,samples))
         else:
-            return torch.tensor(0., device=device)
+            return torch.tensor(0., device=device), torch.tensor(0., device=device)
 
     #print("Scoring cells planes= ", len(plane_indices))
-    log_prob, weight = score_cells(map, plane_indices, coords, feature_samples, occupancy_samples)
+    log_prob, weight = score_cells(map, plane_indices, coords, feature_samples, occupancy_samples, x0=rel_x0, x1=rel_x1)
     log_prob = log_prob.reshape((len(plane_indices),height,width,samples))
     weight = weight.reshape((len(plane_indices),height,width,samples))
 
@@ -122,4 +137,4 @@ def score_pose(map: NeuralMap, cam: Camera, image: torch.Tensor, depths: torch.T
     if dense:
         return prob, weight, pos.reshape((height,width,samples,3)), feature_samples.reshape((c,height,width,samples))
     else:
-        return torch.sum(prob * weight) / (1e-9 + torch.sum(weight))
+        return torch.sum(prob * weight) / (1e-9 + torch.sum(weight)), weight.mean()

@@ -85,7 +85,7 @@ def compute_ray(width, height, camera, device, same_z: bool = True):
 
     if same_z:
         fwd = camera.R @ torch.tensor([0, 0, 1.], device=camera.R.device)
-        scale = 1.0/torch.einsum("ijk,k->ij",dir,fwd)
+        scale = 1.0/torch.einsum("ijk,k->ij",dir,fwd.to(device))
         dir = dir*scale[:,:,None]
 
     return origin, dir

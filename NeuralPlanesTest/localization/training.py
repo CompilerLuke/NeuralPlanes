@@ -41,7 +41,7 @@ class MapBuilderTest(unittest.TestCase):
         ]
 
         self.image_ids = ["cam_A", "cam_B"]
-        self.builder_conf = NeuralMapBuilderConf(chunk_size=100, depth_sigma=0.2)
+        self.builder_conf = NeuralMapBuilderConf(chunk_size=100, depth_sigma=0.2, num_components=1, num_features=1)
 
         R = Rotation.from_rotvec([-90.0,0.0,0.0], degrees=True).as_matrix()
         R = torch.tensor(R,dtype=torch.float)
@@ -59,7 +59,7 @@ class MapBuilderTest(unittest.TestCase):
         self.forward_cam = camera
 
     def test_chunk(self):
-        builder = NeuralMapBuilder(planes=self.basic_planes, image_ids=self.image_ids, cameras=self.cameras,
+        builder = NeuralMapBuilder(planes=self.basic_planes, cameras=self.cameras,
                                    conf=NeuralMapBuilderConf(chunk_size=3))
 
         print(self.basic_planes.coord_size[0])
@@ -125,12 +125,20 @@ class MapBuilderTest(unittest.TestCase):
         self.assertEqual([0,1], builder.visible_camera_idx[1][0][0].tolist(), [])
         self.assertEqual([0], builder.visible_camera_idx[2][0][0].tolist())
 
+    def gen_filled_image(self, value, height=10, width=10):
+        importance = torch.ones((1,height,width))
+        image = torch.full([1, height, width], value) 
+        depth = torch.full((height, width,), 0.5)
+
+        return torch.cat([importance, image], dim=0), depth
+
     def gen_cos_image(self, height=10, width=10):
         v, u = torch.meshgrid(torch.linspace(0, 1, height), torch.linspace(0, 1, width))
+        importance = torch.ones((1,height,width))
         image_cos = torch.stack([0.5*torch.cos(torch.pi * u)+0.5]) # * torch.cos(torch.pi * v)
         depth = torch.full((height, width,), 0.5)
 
-        return image_cos, depth
+        return torch.cat([importance, image_cos], dim=0), depth
 
     def test_sample_images(self):
         builder = NeuralMapBuilder(planes=self.basic_planes, cameras=self.cameras,
@@ -155,7 +163,7 @@ class MapBuilderTest(unittest.TestCase):
 
         orig, dir = compute_ray(width, height, camera, device='cpu')
         x = orig + dir * depth[:, :, None]
-        ax.scatter(x[:,:,0], x[:,:,1], x[:,:,2], c=image[0])
+        ax.scatter(x[:,:,0], x[:,:,1], x[:,:,2], c=image[1])
 
         print(weight)
         print("Weight range", )
@@ -187,10 +195,10 @@ class MapBuilderTest(unittest.TestCase):
 
         height,width = [10,10]
         v,u = torch.meshgrid(torch.linspace(0,1,height), torch.linspace(0,1,width))
-        image_zero = torch.zeros((1,height,width))
-        image_outlier = torch.full((1, height, width), 1.0)
-        image_cos = torch.stack([torch.cos(torch.pi*u)*torch.cos(torch.pi*v)])
-        depth = torch.full((height,width,), 0.5)
+        
+        image_zero,depth = self.gen_filled_image(0.0)
+        image_outlier,depth = self.gen_filled_image(1.0)
+        image_cos,depth = self.gen_cos_image()
 
         camera = self.forward_cam
 
@@ -230,12 +238,9 @@ class MapBuilderTest(unittest.TestCase):
                                        )
                                    ))
 
-        width,height = 10, 10
-        v,u = torch.meshgrid(torch.linspace(0,1,height), torch.linspace(0,1,width))
-        image_cos = torch.stack([torch.cos(torch.pi*u)*torch.cos(torch.pi*v)])
+        image_cos, depth = self.gen_cos_image()
+        image_cos = image_cos[1:]
+        builder.train([{"image": image_cos},{"image": image_cos}], [{"image": depth}, {"image": depth}], log_dir="", save_checkpoint="")
 
-        depth = torch.full((height, width,), 0.5)
-
-
-        builder.train([{"image": image_cos},{"image": image_cos}], [{"image": depth}, {"image": depth}])
-
+if __name__ == '__main__':
+    unittest.main()

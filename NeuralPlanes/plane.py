@@ -4,6 +4,7 @@ from typing import Tuple
 import rectangle_packing_solver as rps
 from NeuralPlanes.camera import frustum_normals
 from matplotlib import pyplot as plt
+from math import ceil
 
 class Planes(nn.Module):
     x0s: torch.Tensor # (n,3)
@@ -153,7 +154,10 @@ def project_to_planes_sparse(planes, pos, stride=8):
     return pixel_ids, plane_ids, coord
 
 
-def draw_planes(ax, planes, stride=10, indices=None, color=None):
+def draw_planes(ax, planes, stride=None, indices=None, color=None):
+    if stride is None:
+        stride = int(ceil(max(planes.atlas_size) / 128))
+
     xs = []
     ys = []
 
