@@ -4,6 +4,7 @@ from typing import Tuple
 import rectangle_packing_solver as rps
 from NeuralPlanes.camera import frustum_normals
 from matplotlib import pyplot as plt
+from math import ceil
 
 class Planes(nn.Module):
     x0s: torch.Tensor # (n,3)
@@ -153,27 +154,48 @@ def project_to_planes_sparse(planes, pos, stride=8):
     return pixel_ids, plane_ids, coord
 
 
-def draw_planes(ax, planes, res=10, indices=None, color=None):
+def draw_planes(ax, planes, stride=None, indices=None, color=None, vmin=None, vmax=None):
+    if stride is None:
+        stride = int(ceil(max(planes.atlas_size) / 512))
+
     xs = []
     ys = []
 
     if indices==None:
         indices = range(len(planes))
 
+    xs = []
     for i in indices:
         width, height = planes.coord_size[i]
-        v, u = torch.meshgrid(torch.linspace(0,1,int(height)), torch.linspace(0,1,int(width)))
+        v, u = torch.meshgrid(torch.linspace(0,1,int(height)//stride), torch.linspace(0,1,int(width)//stride))
 
         x0,u_dir,v_dir = planes.x0s[i], planes.us[i], planes.vs[i]
 
-        x = x0.reshape((1,1,3)) + u_dir.reshape((1,1,3))*u.unsqueeze(2) + v_dir.reshape((1,1,3))*v.unsqueeze(2)
+        x = x0.reshape((1,1,3)).cpu() + u_dir.reshape((1,1,3)).cpu()*u.unsqueeze(2) + v_dir.cpu().reshape((1,1,3))*v.unsqueeze(2)
+        x = x.cpu()
 
+        plane_color = None
         if not color is None:
+            coord = int(planes.coord_x0[i][0]), int(planes.coord_x0[i][1])
+            size = int(planes.coord_size[i][0]), int(planes.coord_size[i][1])
+            #draw_planes(ax, planes, indices=[i], color= self.map.atlas_weight[coord[1]:coord[1]+size[1], coord[0]:coord[0]+size[0]]
+
             if len(color.shape) == 2:
-                color = plt.cm.viridis(color.cpu())
+                #color = torch.nn.functional.grid_sample(color[None,None], coords[None])[0,0]
+                plane_color = color[coord[1]:coord[1]+size[1]:stride, coord[0]:coord[0]+size[0]:stride]
+                plane_color = plane_color.clone().detach().cpu()
+                if vmin and vmax:
+                    plane_color = (plane_color - vmin) / (vmax - vmin)
+                plane_color = plt.cm.viridis(plane_color)
             else:
-                color = color.permute(1,2,0).cpu()
-        ax.plot_surface(x[:,:,0].cpu(), x[:,:,1].cpu(), x[:,:,2].cpu(), facecolors= color)
+                plane_color = color[:, coord[1]:coord[1]+size[1]:stride, coord[0]:coord[0]+size[0]:stride]
+                plane_color = plane_color.clone().detach().cpu()
+                plane_color = plane_color.permute(1,2,0)
+
+        if isinstance(plane_color, torch.Tensor):
+            plane_color = plane_color.numpy()
+        ax.plot_surface(x[:,:,0].numpy(), x[:,:,1].numpy(), x[:,:,2].numpy(), facecolors= plane_color)
+
 
 def make_planes(plane_points, resolution=1):
     few_planes = 5
@@ -237,7 +259,7 @@ def index_1d(vec, id):
     return torch.gather(vec, 0, id.unsqueeze(0).repeat(1, vec.shape[1]), sparse_grad=True).squeeze(0)
 
 
-def plane_box_points(planes: Planes, plane_id: int, rel_x0: torch.Tensor = None, rel_x1: torch.Tensor = None, max_dist=100.0, perp_thr=0.1):
+def plane_box_points(planes: Planes, plane_id: int, rel_x0: torch.Tensor = None, rel_x1: torch.Tensor = None, max_dist=20.0, perp_thr=0.1):
     plane_normal = index_1d(planes.planes, plane_id)[0:3]
 
     rel_x0 = rel_x0 if not rel_x0 is None else (0,0)
@@ -254,7 +276,7 @@ def plane_box_points(planes: Planes, plane_id: int, rel_x0: torch.Tensor = None,
 
     perp_mask = torch.abs(torch.einsum("j,ij->i", plane_normal, planes.planes[:,0:3])) < perp_thr
 
-    mask = (~perp_mask) & (torch.arange((len(planes))) != plane_id)
+    mask = (~perp_mask) & (torch.arange(len(planes),device=perp_mask.device) != plane_id)
 
     # note: current limitation of vmap prevents us from skipping calculations using indices, have to use mask instead
     dist_to_intersec, inter_indices = ray_trace(planes, plane_points_base + plane_normal[None], plane_normal[None].repeat(4,1), mask=mask)

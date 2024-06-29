@@ -2,11 +2,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Callable
 from pathlib import Path
 from NeuralPlanes.camera import Camera
-from NeuralPlanes.plane import make_planes
+from NeuralPlanes.plane import make_planes, Planes
 from NeuralPlanes.utils import select_device
 from NeuralPlanes.pipeline.dataloader import *
 from NeuralPlanes.localization.negative_pose_mining import RansacMiningConf
 from NeuralPlanes.localization.training import NeuralMapBuilder, NeuralMapBuilderConf
+from NeuralPlanes.localization.map import NeuralMap, NeuralMapConf
+from NeuralPlanes.localization.unet import Unet
+from NeuralPlanes.localization.monocular import MonocularDepthModel
 import logging
 from scipy.spatial.transform import Rotation
 from matplotlib import pyplot as plt
@@ -100,7 +103,7 @@ class Images(Dataset):
     def __getitem__(self, index):
         meta = self.images[index]
         image = io.imread(str(self.base_path) + "/" + meta.path)
-        assert not image is None, f"Could not read {path}"
+        assert not image is None, f"Could not read {meta.path}"
         return {
                 "image": image,
                 "camera": meta.camera,
@@ -285,8 +288,8 @@ def parse_floorplan(floor_plan_path):
 
     floor_plan_height, floor_plan_width, _ = floor_plan.shape
     img_rel_to_abs = torch.tensor(transforms["floormap_to_world"])
-    ground = -5
-    height = 20
+    ground = -2
+    height = 10
 
     x0s, x1s, x2s = [], [], []
 
@@ -306,7 +309,10 @@ def parse_floorplan(floor_plan_path):
     for polygon in planes_json:
         contour = torch.stack([torch.tensor([p["x"], p["y"]]) for p in polygon["content"]])
         contour = torch.cat([contour, contour[0].unsqueeze(0)], dim=0)
-        contour = torch.flip(contour, dims=(0,))
+
+        if polygon["labels"]["labelName"] == "in":
+            print("flip")
+            contour = torch.flip(contour, dims=(0,))
 
         n = contour.shape[0]
 
@@ -350,117 +356,13 @@ def parse_session(session_map_path, filter: Callable[[str],str]):
 
     return images
 
-def collate_fn(preprocess):
-    def apply(data):
-        result = {}
-        for data in data:
-            data = preprocess(data)
-            for key in data:
-                if not key in result:
-                    result[key] = [data[key]]
-                else:
-                    result[key].append(data[key])
-        result = {k: torch.stack(v) if isinstance(v[0],torch.Tensor) else v for k,v in result.items()}
-        return result
-    return apply
-
 def create_dataloader(dataset: Images, preprocess, conf: DataloaderConf):
     logger.info("Preprocessing on ", conf.device)
     dataloader = DataLoader(dataset, batch_size=conf.batch_size, shuffle=False, num_workers=conf.num_workers, collate_fn=collate_fn(preprocess))
     return dataloader
-class Model(nn.Module):
-    def __init__(self):
-        super().__init__()    
-    
-    def preprocess(self, data):
-        pass 
 
-    def forward(self):
-        pass 
-
-class MonocularDepthModel(Model):
-    def __init__(self):
-        super().__init__()
-        self.model = torch.hub.load('yvanyin/metric3d', 'metric3d_vit_small', pretrain=True)
-
-    """
-    Copied from https://github.com/YvanYin/Metric3D/blob/main/hubconf.py#L145
-    """
-    def preprocess(self, data):
-        rgb_origin = data["image"]
-        camera = data["camera"]
-        
-        # input_size = (544, 1216) # for convnext model
-        input_size = (616, 1064) # for vit model
-
-        h, w = rgb_origin.shape[:2]
-        scale = min(input_size[0] / h, input_size[1] / w)
-        rgb = cv2.resize(rgb_origin, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-        # remember to scale intrinsic, hold depth
-        intrinsic = [camera.f[0] * scale, camera.f[1] * scale, camera.c[0] * scale, camera.c[1] * scale]
-        # padding to input_size
-        padding = [123.675, 116.28, 103.53]
-        h, w = rgb.shape[:2]
-        pad_h = input_size[0] - h
-        pad_w = input_size[1] - w
-        pad_h_half = pad_h // 2
-        pad_w_half = pad_w // 2
-        rgb = cv2.copyMakeBorder(rgb, pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half, cv2.BORDER_CONSTANT, value=padding)
-        pad_info = [pad_h_half, pad_h - pad_h_half, pad_w_half, pad_w - pad_w_half]
-
-        #### normalize
-        mean = torch.tensor([123.675, 116.28, 103.53]).float()[:, None, None]
-        std = torch.tensor([58.395, 57.12, 57.375]).float()[:, None, None]
-        rgb = torch.from_numpy(rgb.transpose((2, 0, 1))).float()
-        rgb = torch.div((rgb - mean), std)
-
-        return { "rgb": rgb, "intrinsic": intrinsic, "origin_size": rgb_origin.shape, "pad_info": pad_info, "path": data["path"] }
-    def forward(self, data):
-        rgb = data["rgb"]
-
-        with torch.no_grad():
-            pred_depths, confidence, output_dict = self.model.inference({'input': rgb})
-
-        result = []
-
-        for pred_depth, intrinsic, origin_size, pad_info in zip(pred_depths, data["intrinsic"], data["origin_size"], data["pad_info"]):
-            pred_depth = pred_depth[pad_info[0] : pred_depth.shape[0] - pad_info[1], pad_info[2] : pred_depth.shape[1] - pad_info[3]]
-        
-            # upsample to original size
-            pred_depth = torch.nn.functional.interpolate(pred_depth[:, None, :, :], origin_size[:2], mode='bilinear').squeeze(0).squeeze(0)
-            ###################### canonical camera space ######################
-
-            #### de-canonical transform
-            canonical_to_real_scale = intrinsic[0] / 1000.0 # 1000.0 is the focal length of canonical camera
-            pred_depth = pred_depth * canonical_to_real_scale # now the depth is metric
-            pred_depth = torch.clamp(pred_depth, 0, 300)
-
-            result.append(pred_depth)
-
-        return { "image": result }
-
-class Backbone(Model):
-    def __init__(self, conf):
-        super().__init__()
-        self.model = torch.hub.load('pytorch/vision:v0.10.0', 'fcn_resnet50', pretrained=True)
-        #self.model.classifier[4] = nn.Identity()
-
-        print(self.model)
-
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-        self.device = select_device()
-        self.model = self.model.eval().to(self.device)
-    def preprocess(self, data):
-        return {"image": self.transform(data["image"])}
-    def forward(self, data):
-        return {"image": self.model(data["image"].to(self.device))["out"] }
-
-def precompute_depth(model, out_dir, images: Images, dataloader_conf):
-    model = MonocularDepthModel()
-    preprocess = compose([resize(max_size=512), model.preprocess])
+def precompute_depth(model, out_dir, images: Images, max_size, dataloader_conf):
+    preprocess = compose([resize(max_size=max_size), model.preprocess])
     model = model.to(dataloader_conf.device)
     dataloader = create_dataloader(images, preprocess, conf= dataloader_conf)
 
@@ -468,11 +370,6 @@ def precompute_depth(model, out_dir, images: Images, dataloader_conf):
         path = data["path"]
         data= {k: v.to(dataloader_conf.device) if isinstance(v,torch.Tensor) else v for k,v in data.items()}
         output = model(data)
-
-        if i == 0:
-            logger.info("Processing image ", path)
-            logger.info(output.keys())
-            logger.info(nested_shape(output))
 
         for depth, path in zip(output["image"], path):
             depth = depth.detach().cpu().numpy().astype(np.half)
@@ -482,84 +379,242 @@ def precompute_depth(model, out_dir, images: Images, dataloader_conf):
             path.parent.mkdir(parents=True, exist_ok=True)
             error = io.imsave(str(path), depth)
 
-if __name__ == "__main__":
-    Backbone({})
+def get_preprocessed_images(images, session_map_path_small, session_map_path_depth, max_size):
+    images_small = copy.deepcopy(images)
+    images_depth = copy.deepcopy(images)
 
+    images_small.base_path = session_map_path_small
+    images_depth.base_path = session_map_path_depth
+
+    cameras = []
+    for i in tqdm.tqdm(range(len(images))):
+        image = images.images[i]
+        path = image.path
+        
+        depth_path = str(Path(path).with_suffix(".tif"))
+        images_depth.images[i].path = depth_path
+    
+        depth = io.imread(str(session_map_path_depth / depth_path))
+        max_depth = min(depth.max(), 20)
+
+        camera = image.camera.scale(min(1.0, max_size / max(image.camera.size)))
+        camera.far = max_depth
+
+        images_small.images[i].camera = camera 
+        images_depth.images[i].camera = camera
+        cameras.append(camera)
+
+    return cameras, images_small, images_depth
+
+
+def downsize_images(out_dir, images: Images, max_size, dataloader_conf):
+    preprocess = compose([resize(max_size=max_size)])
+    dataloader = create_dataloader(images, preprocess, conf= dataloader_conf)
+
+    for i, data in enumerate(tqdm.tqdm(dataloader)):
+        path = data["path"]
+        for image, path in zip(data["image"], path):
+            path = out_dir / Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            error = io.imsave(str(path), image)
+
+def load_map(model_checkpoint, encoder, conf, height=1032, width=631):
+    device = select_device()
+
+    n_planes = 130
+    n_comp = conf.num_components
+    n_feat = conf.num_features
+    map = NeuralMap(planes=Planes(x0s=torch.zeros((n_planes,3)),
+                                    us=torch.zeros((n_planes,3)), 
+                                    vs=torch.zeros((n_planes,3)), 
+                                    planes=torch.zeros((n_planes,4)), 
+                                    coord_x0=torch.zeros((n_planes,2)), 
+                                    coord_size=torch.zeros((n_planes,2)), 
+                                    atlas_size=[width, height]), 
+                        atlas_alpha=torch.zeros((n_comp,height,width), device=device), 
+                        atlas_mu=torch.zeros((n_comp, n_feat, height, width),device=device), 
+                        atlas_var=torch.zeros((n_comp, n_feat, height, width),device=device), 
+                        atlas_weight=torch.zeros((height, width),device=device), encoder=encoder, conf=conf)
+    map.load_state_dict(torch.load(model_checkpoint), strict=False)
+    encoder = encoder.to(device)
+    return map
+
+def gen_planes_from_floorplan(lamar_path):
+    floor_plan_img, plane_points, floorplan_to_world = parse_floorplan(lamar_path / "floor_plan")
+
+    plot_planes = False 
+    if plot_planes:
+        fig, ax = plt.subplots()
+        plot_image_poses(fig, ax, images)
+        plot_floor_planes(fig, ax, plane_points)
+        plt.show()
+
+    planes = make_planes(plane_points, resolution=3)
+    return planes
+
+class ConvBlockDown(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.max_pool = nn.MaxPool2d(2, stride=2, padding=0)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.relu(x)
+        x = self.max_pool(x)
+        return x
+
+class ConvBlockUp(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.ConvTranspose2d(out_channels, out_channels, kernel_size=(2,2), stride=2)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = torch.relu(x)
+        x = self.conv2(x)
+        x = torch.relu(x)
+        return x
+
+
+class ConvEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.down_image0 = ConvBlockDown(3,4)
+        self.down_image1 = ConvBlockDown(4,8)
+        self.down_image2 = ConvBlockDown(8,16)
+        self.down_image3 = ConvBlockDown(16,32)
+
+        self.up_image3 = ConvBlockUp(32,16)
+        self.up_image2 = ConvBlockUp(32,24)
+        self.up_image1 = ConvBlockUp(32,28)
+        self.up_image0 = ConvBlockUp(32,16)
+
+        self.final = nn.Sequential(
+            nn.Conv2d(19,16,(3,3),padding=(1,1)),
+            nn.ReLU()
+        )
+
+    def preprocess(self, data):
+        return {**data, "image": torch.tensor(data["image"]).permute(2, 0, 1) / 255.}
+
+    def forward(self, x):
+        x = x["image"]
+        x0 = self.down_image0(x)
+        x1 = self.down_image1(x0)
+        x2 = self.down_image2(x1)
+        x3 = self.down_image3(x2)
+
+        x4 = torch.cat([x2, self.up_image3(x3)], dim=1)
+        x5 = torch.cat([x1, self.up_image2(x4)], dim=1)
+        x6 = torch.cat([x0, self.up_image1(x5)], dim=1)
+        x7 = torch.cat([x, self.up_image0(x6)], dim=1)
+        x8 = self.final(x7)
+
+        return {"image": x8}
+
+
+class Encoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.alpha = nn.Parameter()
+        self.conv_encoder = ConvEncoder()
+    def preprocess(self, data):
+        return {**data, "image": torch.tensor(data["image"]).permute(2,0,1) / 255. }
+
+    def forward(self, data):
+        x = data["image"]
+        #x = self.conv_encoder(x)
+        x = torch.cat([torch.ones((x.shape[0],1,x.shape[2],x.shape[3]), device=x.device), x], dim=1)
+        print("IMAGE")
+        print(x.shape)
+        return {**data, "image": x}
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
                     prog='NeuralPlanesLamarTrain',
                     description='',
                     epilog='')
     parser.add_argument('directory')
+    parser.add_argument('-load-checkpoint', default=False, type=str2bool)
+    parser.add_argument('-train', default=True, type=str2bool)
+    parser.add_argument("-num-epochs", default=6, type=int)
+
     args = parser.parse_args()
-    
     lamar_path = Path(args.directory)
+    load_checkpoint = args.load_checkpoint
+    gen_only = not args.train
+    num_epochs = args.num_epochs
+
+    max_size = 256
 
     session_map_path = lamar_path / "sessions" / "map"
     session_map_image_path = session_map_path / "raw_data"
-    session_map_path_precompute = lamar_path / "sessions" / "map_precompute_256"
+    session_map_path_precompute = lamar_path / "sessions" / ("map_precompute_"+str(max_size))
     session_map_path_depth = session_map_path_precompute / "depth"
+    session_map_path_small = session_map_path_precompute / "small_images"
+    model_checkpoint = "checkpoint/model.pt"
 
     images = parse_session(session_map_path, lambda path: path.startswith("ios"))
 
     print("Map images ", len(images))
 
-    floor_plan_img, plane_points, floorplan_to_world = parse_floorplan(lamar_path / "floor_plan")
-
-    fig, ax = plt.subplots()
-
-    #plot_image_poses(fig, ax, images)
-    #plot_floor_planes(fig, ax, plane_points)
-    #plt.show()
-
     dataloader_conf = DataloaderConf(
-        batch_size=4,
-        cache_size=16,
+        batch_size=16,
+        cache_size=64,
         num_workers=0
     )
 
     if os.path.exists(session_map_path_depth):
         print("Already pre-computed depth:", session_map_path_depth)
     else:
-        precompute_depth(MonocularDepthModel(), session_map_path_depth, images, dataloader_conf)
+        precompute_depth(MonocularDepthModel(), session_map_path_depth, images, max_size, dataloader_conf)
 
-    planes = make_planes(plane_points)
+    if os.path.exists(session_map_path_small):
+        print("Already down-sampled images:", session_map_path_small)
+    else:
+        downsize_images(session_map_path_small, images, max_size, dataloader_conf)
 
+    cameras, images_small, images_depth = get_preprocessed_images(images, session_map_path_small, session_map_path_depth, max_size)
 
-    max_size = 256
+    map_builder_conf = NeuralMapBuilderConf(num_components=4, num_features=16, cluster_ratio=1.0, num_epochs=num_epochs, max_views_per_chunk=12, depth_sigma=0.2, depth_distribution_samples=64, column_sampling_density=128, chunk_size=32, ransac=RansacMiningConf(num_ref_kps=20, kp_per_ref=10, ransac_it=20, ransac_sample=10, top_k=5))
 
-    depths = Images(images=[], by_path={}, base_path=session_map_path_depth)
-
-    cameras = []
-    for image in tqdm.tqdm(images):
-        path = image.path
-        new_path = str(Path(path).with_suffix(".tif"))
-
-        depth = io.imread(str(session_map_path_depth / new_path))
-        max_depth = depth.max()
-
-        camera = image.camera.scale(min(1.0, max_size / max(image.camera.size)))
-        camera.far = max(5, min(max_depth, 20))
-
-        print("Max depth ", max_depth, camera.far, new_path, "dtype= ", depth.dtype, "depth= ", depth.shape, "camera=", camera.size)
-        image.camera = camera
-
-        meta = copy.copy(images.by_path[path])
-        meta.path = new_path
-
-        cameras.append(camera)
-        depths.images.append(meta)
-        depths.by_path[path] = meta
-
-    map_builder_conf = NeuralMapBuilderConf(num_components=4, num_features_backbone=21, num_features=8, depth_sigma=0.5, chunk_size=3, ransac=RansacMiningConf(num_ref_kps=20, kp_per_ref=5, ransac_it=20, ransac_sample=10, top_k=5))
-    builder = NeuralMapBuilder(planes, cameras=cameras, conf=map_builder_conf)
+    encoder = Unet(encoder_freeze=True, classes=map_builder_conf.num_features+1, backbone_name="vgg19")
+    if load_checkpoint:
+        map = load_map(model_checkpoint, encoder, map_builder_conf)
+        encoder = map.encoder
+        builder = NeuralMapBuilder(map=map, cameras=cameras, conf=map_builder_conf)
+    else:
+        planes = gen_planes_from_floorplan(lamar_path)
+        builder = NeuralMapBuilder(planes=planes, cameras=cameras, encoder=encoder, conf=map_builder_conf)
 
     accesses = []
     for i, j, k in builder.chunks():
         accesses.extend(list(builder.visible_camera_idx[i][j][k]))
-    backbone = Backbone(conf={})
 
-    image_loader = SequentialLoader(images, accesses=accesses, conf=dataloader_conf, collate_fn=collate_fn(compose([resize(max_size), backbone.preprocess])), apply_fn=backbone)
-    depth_loader = SequentialLoader(depths, accesses=accesses, conf=dataloader_conf, collate_fn=collate_fn(lambda x: {"image": torch.tensor(x["image"][:,:,0], dtype=torch.float)}))
+    image_loader = SequentialLoader(images_small, accesses=accesses, conf=dataloader_conf, collate_fn=collate_fn(lambda x: encoder.preprocess(x)))
+    depth_loader = SequentialLoader(images_depth, accesses=accesses, conf=dataloader_conf, collate_fn=collate_fn(lambda x: {"image": torch.tensor(x["image"][:,:,0], dtype=torch.float)}))
 
-    builder.train(image_loader, depth_loader)
+    if gen_only:
+        builder.gen(image_loader, depth_loader, model_checkpoint)
+        exit()
+
+    torch.autograd.set_detect_anomaly(True)
+    builder.train(image_loader, depth_loader, "logs/fit/run", model_checkpoint)

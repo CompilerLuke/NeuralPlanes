@@ -1,8 +1,8 @@
+
 from dataclasses import dataclass
 import torch
 from NeuralPlanes import utils
-
-@dataclass 
+@dataclass
 class Camera:
     size: torch.Tensor
     f: torch.Tensor 
@@ -186,5 +186,3 @@ def frustum_ray_intersection(frustum_points: torch.Tensor, origin: torch.Tensor,
     t_max = torch.max(torch.where(mask, t, torch.tensor(-torch.inf)), dim=0)[0]
 
     return t_min, t_max
-
-

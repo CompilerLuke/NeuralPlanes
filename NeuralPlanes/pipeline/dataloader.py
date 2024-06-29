@@ -26,8 +26,12 @@ def nested_shape(value):
         return {k: nested_shape(v) for k,v in value.items()}
     return value 
 
-def resize(max_size):
-    def apply(data):
+class resize:
+    def __init__(self, max_size):
+        self.max_size = max_size 
+
+    def __call__(self, data):
+        max_size = self.max_size
         if not "image" in data:
             return data
         
@@ -47,14 +51,14 @@ def resize(max_size):
             return { **data, "image": image, "camera": camera.scale(scale)}
         return { **data, "image": image }
 
-    return apply
+class compose:
+    def __init__(self, fns):
+        self.fns = fns 
 
-def compose(fns):
-    def apply(data):
-        for fn in fns:
+    def __call__(self, data):
+        for fn in self.fns:
             data = fn(data)
         return data
-    return apply
 
 class MapDataset:
     def __init__(self, dataset1, dataset2):
@@ -131,7 +135,9 @@ class SequentialLoader:
         self.current_access = 0
         self.current_batch_number = -1
         self.batch_number = batch_number
+
         self.dataloader = DataLoader(ReorderDataset(dataset=dataset, indices=load_items), num_workers=conf.num_workers, collate_fn=collate_fn, batch_size=conf.batch_size)
+
         self.iterator = None
         self.load_items = load_items
         self.load_cache_slot_index = load_cache_slot_index
@@ -144,6 +150,7 @@ class SequentialLoader:
     def fetch_next_batch(self):
         current_batch_number = self.current_batch_number+1
         data = next(self.iterator)
+        print("Fetched batch")
         if self.apply_fn:
             data = self.apply_fn(data)
         
@@ -159,7 +166,7 @@ class SequentialLoader:
                 data_j = data[j]
             self.cache[self.load_cache_slot_index[idx]] = data_j
 
-        self.current_batch_number = self.current_batch_number+1
+        self.current_batch_number = current_batch_number
 
     def __getitem__(self, access):
         if access != self.accesses[self.current_access]:
@@ -167,11 +174,43 @@ class SequentialLoader:
         idx = self.current_access
         batch_number = self.batch_number[idx]
         if batch_number == 0 and self.current_batch_number != 0:
+            del self.iterator
+            self.current_batch_number = -1
             self.iterator = self.dataloader.__iter__()
             self.fetch_next_batch()
-        if batch_number > self.current_batch_number:
+        elif batch_number > self.current_batch_number:
             self.fetch_next_batch()
 
         self.current_access = (self.current_access + 1) % len(self.accesses)
         return self.cache[self.cache_slot_index[idx]]
 
+
+class collate_fn:
+    def __init__(self, preprocess=None, preprocess_batch=None):
+        self.preprocess = preprocess 
+        self.preprocess_batch = preprocess_batch
+
+    def __call__(self, data):
+        preprocess, preprocess_batch = self.preprocess, self.preprocess_batch
+
+        result = {}
+        for data in data:
+            if preprocess:
+                data = preprocess(data)
+            for key in data:
+                if not key in result:
+                    result[key] = [data[key]]
+                else:
+                    result[key].append(data[key])
+
+        def stack(value):
+            if isinstance(value[0], torch.Tensor):
+                return torch.stack(value)
+            if isinstance(value[0], np.ndarray):
+                return np.stack(value)
+            return value 
+
+        result = {k: stack(v) for k,v in result.items()}
+        if preprocess_batch:
+            result = preprocess_batch(result)
+        return result

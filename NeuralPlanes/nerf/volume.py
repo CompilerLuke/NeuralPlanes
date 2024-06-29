@@ -60,7 +60,7 @@ def raytrace_volume(planes, min_depth, max_depth, res, camera: Union[List[Camera
 
     pixel_ids, plane_ids, coord = project_to_planes_sparse(planes, pos)
     
-    coord = 2*(coord / torch.tensor(planes.atlas_size,device=device))
+    coord = 2*(coord / torch.tensor(planes.atlas_size,device=device)) - 1
 
     features = nn.functional.grid_sample(atlas.unsqueeze(0), coord.unsqueeze(0).unsqueeze(2))
     features = features[0, :, :, 0]
@@ -74,26 +74,22 @@ def raytrace_volume(planes, min_depth, max_depth, res, camera: Union[List[Camera
 
     density = density_decoder(combined_features.transpose(0,1)) # (bxdxhxw)
     density = density.reshape((batch_size, depth, height, width))
-    
-    alpha = dt * density 
 
-    return values, alpha, t
+    return values, density, t, dt
 
 
 @torch.compile
-def alpha_weight(values, alpha):
-    batch,depth,height,width = alpha.shape
+def norm_alpha_weight(values, density, dt):
+    batch,depth,height,width = density.shape
+    alpha = density * dt
     alpha = alpha / (1e-9 + alpha.sum(dim=1)[:,None,:,:] )
     weighted_values = values * alpha[:,None]
     return weighted_values.sum(dim=2)
 
 @torch.compile
-def alpha_blend(values, alpha):
-    batch,depth,height,width = alpha.shape
-    device = alpha.device
-
-    alpha = 1 - torch.exp(-alpha)
-    alpha = alpha * torch.cumprod(torch.cat([torch.ones((batch,1,height,width), device=device), 1-alpha[:,:-1]], dim=1),dim=1)
-
-    weighted_values = values * alpha[:,None]
+def alpha_blend(values, density, dt):
+    batch,depth,height,width = density.shape
+    device = density.device
+    alpha = 1 - torch.exp(-density * dt)
+    weighted_values = values * alpha * torch.cumprod(torch.cat([torch.ones((batch,1,height,width), device=device), 1-alpha[:,:-1]], dim=1),dim=1)
     return weighted_values.sum(dim=2)
